@@ -86,10 +86,10 @@ describe("path-prefixed auth servers", () => {
 			authorizationUrl: "https://gateway.example.com/my-service/oauth/authorize",
 			tokenUrl: "https://gateway.example.com/my-service/oauth/token",
 		});
-		// Absolute well-known was tried first (existing behavior)
-		expect(calls[0]).toBe("https://gateway.example.com/.well-known/oauth-authorization-server");
-		// Relative well-known was tried as fallback
-		expect(calls).toContain("https://gateway.example.com/my-service/.well-known/oauth-authorization-server");
+		// Issuer-specific (path-prefixed) well-known now wins; the origin root is
+		// only a fallback, so it is never probed once the prefixed doc resolves.
+		expect(calls[0]).toBe("https://gateway.example.com/my-service/.well-known/oauth-authorization-server");
+		expect(calls).not.toContain("https://gateway.example.com/.well-known/oauth-authorization-server");
 	});
 
 	it("discovers endpoints via single-segment path prefix (no trailing endpoint segment)", async () => {
@@ -122,8 +122,8 @@ describe("path-prefixed auth servers", () => {
 			authorizationUrl: "https://gateway.example.com/my-service/oauth/authorize",
 			tokenUrl: "https://gateway.example.com/my-service/oauth/token",
 		});
-		expect(calls[0]).toBe("https://gateway.example.com/.well-known/oauth-authorization-server");
-		expect(calls).toContain("https://gateway.example.com/my-service/.well-known/oauth-authorization-server");
+		expect(calls[0]).toBe("https://gateway.example.com/my-service/.well-known/oauth-authorization-server");
+		expect(calls).not.toContain("https://gateway.example.com/.well-known/oauth-authorization-server");
 	});
 
 	it("falls back to RFC 8414 path-ful issuer form (/.well-known/oauth-authorization-server/<path>)", async () => {
@@ -299,6 +299,68 @@ describe("resource_metadata chain", () => {
 			resource: "https://gateway.example.com/my-service/custom-resource",
 		});
 		expect(calls).toContain("https://gateway.example.com/my-service/.well-known/oauth-protected-resource");
+	});
+});
+
+describe("issuer-specific auth-server metadata (DCR)", () => {
+	it("prefers the issuer-specific document and carries the registration endpoint and resource scopes", async () => {
+		const fetchImpl = mockFetch((input: FetchInput) => {
+			const url = String(input);
+
+			// RFC 9728 protected-resource metadata: path-ful issuer + resource scopes.
+			if (url === "https://mcp.example.com/.well-known/oauth-protected-resource/v1/mcp") {
+				return new Response(
+					JSON.stringify({
+						resource: "https://mcp.example.com/v1/mcp",
+						authorization_servers: ["https://auth.example.com/TENANT"],
+						scopes_supported: ["read:jira-work", "write:jira-work", "offline_access"],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+
+			// Origin-root metadata resolves but is INCOMPLETE: auth/token endpoints
+			// yet no registration_endpoint (mirrors Atlassian). It must not shadow
+			// the issuer-specific document below.
+			if (url === "https://auth.example.com/.well-known/oauth-authorization-server") {
+				return new Response(
+					JSON.stringify({
+						authorization_endpoint: "https://auth.example.com/authorize",
+						token_endpoint: "https://auth.example.com/oauth/token",
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+
+			// Issuer-specific (path-prefixed) document carries the DCR registration endpoint.
+			if (url === "https://auth.example.com/TENANT/.well-known/oauth-authorization-server") {
+				return new Response(
+					JSON.stringify({
+						authorization_endpoint: "https://auth.example.com/authorize",
+						token_endpoint: "https://auth.example.com/oauth/token",
+						registration_endpoint: "https://auth.example.com/TENANT/dcr/register",
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+
+			return new Response("not found", { status: 404 });
+		});
+
+		const oauth = await discoverOAuthEndpoints(
+			"https://mcp.example.com/v1/mcp",
+			undefined,
+			"https://mcp.example.com/.well-known/oauth-protected-resource/v1/mcp",
+			{ fetch: fetchImpl },
+		);
+
+		expect(oauth).toEqual({
+			authorizationUrl: "https://auth.example.com/authorize",
+			tokenUrl: "https://auth.example.com/oauth/token",
+			registrationUrl: "https://auth.example.com/TENANT/dcr/register",
+			scopes: "read:jira-work write:jira-work offline_access",
+			resource: "https://mcp.example.com/v1/mcp",
+		});
 	});
 });
 

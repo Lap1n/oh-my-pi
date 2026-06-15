@@ -12,6 +12,8 @@ export interface OAuthEndpoints {
 	clientId?: string;
 	scopes?: string;
 	resource?: string;
+	/** RFC 7591 dynamic client registration endpoint, when the issuer advertises one. */
+	registrationUrl?: string;
 }
 
 export interface AuthDetectionResult {
@@ -258,7 +260,7 @@ export async function discoverOAuthEndpoints(
 	serverUrl: string,
 	authServerUrl?: string,
 	resourceMetadataUrl?: string,
-	opts?: { fetch?: FetchImpl; protectedResource?: string },
+	opts?: { fetch?: FetchImpl; protectedResource?: string; protectedResourceScopes?: string },
 ): Promise<OAuthEndpoints | null> {
 	const fetchImpl: FetchImpl = opts?.fetch ?? fetch;
 	const wellKnownPaths = [
@@ -273,6 +275,11 @@ export async function discoverOAuthEndpoints(
 	const visitedAuthServers = new Set<string>();
 
 	let protectedResource = opts?.protectedResource;
+	let resourceScopes = opts?.protectedResourceScopes;
+	const scopesFromMeta = (meta: Record<string, unknown>): string | undefined =>
+		Array.isArray(meta.scopes_supported)
+			? meta.scopes_supported.filter((s): s is string => typeof s === "string").join(" ") || undefined
+			: undefined;
 
 	// Step 1: If a resource_metadata URL was provided, fetch it to discover auth servers.
 	// This follows the RFC 9728 chain: resource_metadata → authorization_servers.
@@ -289,6 +296,7 @@ export async function discoverOAuthEndpoints(
 				if (typeof meta.resource === "string" && meta.resource.trim() !== "") {
 					protectedResource = meta.resource;
 				}
+				resourceScopes = scopesFromMeta(meta) ?? resourceScopes;
 				const authServers = Array.isArray(meta.authorization_servers)
 					? meta.authorization_servers.filter((entry): entry is string => typeof entry === "string")
 					: [];
@@ -313,10 +321,14 @@ export async function discoverOAuthEndpoints(
 	}
 
 	const findEndpoints = (metadata: Record<string, unknown>): OAuthEndpoints | null => {
+		const registrationUrl =
+			typeof metadata.registration_endpoint === "string"
+				? metadata.registration_endpoint
+				: typeof metadata.registrationUrl === "string"
+					? metadata.registrationUrl
+					: undefined;
+
 		if (metadata.authorization_endpoint && metadata.token_endpoint) {
-			const scopesSupported = Array.isArray(metadata.scopes_supported)
-				? metadata.scopes_supported.filter((scope): scope is string => typeof scope === "string").join(" ")
-				: undefined;
 			const resource = typeof metadata.resource === "string" ? metadata.resource : protectedResource;
 
 			return {
@@ -333,13 +345,15 @@ export async function discoverOAuthEndpoints(
 									? metadata.public_client_id
 									: undefined,
 				scopes:
-					scopesSupported ||
+					scopesFromMeta(metadata) ||
 					(typeof metadata.scopes === "string"
 						? metadata.scopes
 						: typeof metadata.scope === "string"
 							? metadata.scope
-							: undefined),
+							: undefined) ||
+					resourceScopes,
 				resource,
+				registrationUrl,
 			};
 		}
 
@@ -362,12 +376,15 @@ export async function discoverOAuthEndpoints(
 										? oauthData.public_client_id
 										: undefined,
 					scopes:
-						typeof oauthData.scopes === "string"
+						(typeof oauthData.scopes === "string"
 							? oauthData.scopes
 							: typeof oauthData.scope === "string"
 								? oauthData.scope
-								: undefined,
+								: undefined) || resourceScopes,
 					resource,
+					registrationUrl:
+						registrationUrl ??
+						(typeof oauthData.registration_endpoint === "string" ? oauthData.registration_endpoint : undefined),
 				};
 			}
 		}
@@ -401,6 +418,7 @@ export async function discoverOAuthEndpoints(
 								typeof metadata.resource === "string" && metadata.resource.trim() !== ""
 									? metadata.resource
 									: protectedResource;
+							const discoveredResourceScopes = scopesFromMeta(metadata) ?? resourceScopes;
 
 							for (const discoveredAuthServer of authServers) {
 								if (visitedAuthServers.has(discoveredAuthServer)) {
@@ -409,6 +427,7 @@ export async function discoverOAuthEndpoints(
 								const discovered = await discoverOAuthEndpoints(serverUrl, discoveredAuthServer, undefined, {
 									fetch: fetchImpl,
 									protectedResource: discoveredProtectedResource,
+									protectedResourceScopes: discoveredResourceScopes,
 								});
 								if (discovered) return discovered;
 							}
@@ -446,8 +465,13 @@ function buildWellKnownUrls(wellKnownPath: string, baseUrl: string): URL[] {
 	const prefixPath = lastSlash === 0 ? normalizedPath : normalizedPath.slice(0, lastSlash);
 	const relUrl = new URL(wellKnownPath.slice(1), `${parsed.origin}${prefixPath}/`);
 
-	const candidates: URL[] = [absUrl];
-	const seen = new Set<string>([absUrl.href]);
+	// Issuer-specific candidates take precedence over the origin-root form: RFC
+	// 8414 §3.1 places the metadata document under the issuer's path, and the
+	// origin-root document belongs to the bare-origin issuer (a different
+	// issuer). Some providers (e.g. Atlassian) serve a registration-less doc at
+	// the root that would otherwise shadow the complete issuer-specific one.
+	const candidates: URL[] = [];
+	const seen = new Set<string>();
 	const push = (u: URL): void => {
 		if (!seen.has(u.href)) {
 			candidates.push(u);
@@ -462,6 +486,9 @@ function buildWellKnownUrls(wellKnownPath: string, baseUrl: string): URL[] {
 		const pathfulUrl = new URL(`${wellKnownPath}${normalizedPath}`, parsed.origin);
 		push(pathfulUrl);
 	}
+
+	// Origin-root fallback (correct for bare-origin issuers).
+	push(absUrl);
 
 	return candidates;
 }

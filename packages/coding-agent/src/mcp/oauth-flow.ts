@@ -199,6 +199,8 @@ export interface MCPOAuthConfig {
 	resource?: string;
 	/** Fetch implementation for token exchange and discovery requests. */
 	fetch?: FetchImpl;
+	/** RFC 7591 dynamic client registration endpoint discovered for this server. */
+	registrationUrl?: string;
 }
 
 /**
@@ -438,6 +440,9 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 	}
 
 	async #resolveRegistrationEndpoint(): Promise<string | null> {
+		const configured = this.config.registrationUrl?.trim();
+		if (configured) return configured;
+
 		const authorizationUrl = new URL(this.config.authorizationUrl);
 
 		// origin-root well-known; most servers serve metadata here.

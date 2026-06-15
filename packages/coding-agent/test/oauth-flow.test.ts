@@ -550,4 +550,51 @@ describe("mcp oauth flow", () => {
 		expect(tokenParams.get("grant_type")).toBe("refresh_token");
 		expect(tokenParams.get("resource")).toBeNull();
 	});
+
+	it("registers at the configured registration endpoint and builds a direct authorization URL", async () => {
+		let registrationTarget: string | undefined;
+		let registrationPayload: Record<string, unknown> | undefined;
+		const fetchImpl: FetchImpl = async (input, init) => {
+			const url = String(input);
+			if (url === "https://auth.example.com/TENANT/dcr/register") {
+				registrationTarget = url;
+				registrationPayload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+				return new Response(JSON.stringify({ client_id: "dcr-client" }), {
+					status: 201,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			throw new Error(`Unexpected fetch: ${url}`);
+		};
+
+		const flow = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://auth.example.com/authorize",
+				tokenUrl: "https://auth.example.com/oauth/token",
+				registrationUrl: "https://auth.example.com/TENANT/dcr/register",
+				scopes: "read:jira-work offline_access",
+				resource: "https://mcp.example.com/v1/mcp",
+				fetch: fetchImpl,
+			},
+			{},
+		);
+
+		const { url } = await flow.generateAuthUrl("state-xyz", "http://127.0.0.1:51000/callback");
+		const authUrl = new URL(url);
+
+		// DCR hit the discovered endpoint directly — no well-known derivation from the auth URL origin.
+		expect(registrationTarget).toBe("https://auth.example.com/TENANT/dcr/register");
+		expect(registrationPayload?.redirect_uris).toEqual(["http://127.0.0.1:51000/callback"]);
+		expect(flow.resolvedClientId).toBe("dcr-client");
+
+		// Authorization request carries the full parameter set in the query (the redirect_uri
+		// Atlassian's consent screen requires) — no PAR `request_uri` indirection.
+		expect(`${authUrl.origin}${authUrl.pathname}`).toBe("https://auth.example.com/authorize");
+		expect(authUrl.searchParams.get("client_id")).toBe("dcr-client");
+		expect(authUrl.searchParams.get("redirect_uri")).toBe("http://127.0.0.1:51000/callback");
+		expect(authUrl.searchParams.get("scope")).toBe("read:jira-work offline_access");
+		expect(authUrl.searchParams.get("resource")).toBe("https://mcp.example.com/v1/mcp");
+		expect(authUrl.searchParams.get("code_challenge")).not.toBeNull();
+		expect(authUrl.searchParams.get("request_uri")).toBeNull();
+	});
 });

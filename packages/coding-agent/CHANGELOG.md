@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- MCP OAuth dynamic client registration now works for authorization servers whose issuer carries a path (e.g. Atlassian's remote MCP at `https://mcp.atlassian.com/v1/mcp`). Discovery prefers the issuer-specific authorization-server metadata document (RFC 8414 §3.1) over the origin-root one, captures its `registration_endpoint`, and the OAuth flow registers against the discovered endpoint instead of re-deriving it from the authorization URL origin — so servers that require DCR (no static `client_id`) authenticate instead of failing with a missing `client_id`. Requested scopes also fall back to the protected resource's `scopes_supported` when the authorization server omits them.
+
 ## [16.0.1] - 2026-06-15
 
 ### Breaking Changes
