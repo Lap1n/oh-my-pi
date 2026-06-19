@@ -3,7 +3,7 @@ import { PASTE_CODE_LOGIN_PROVIDERS } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
 import type { Component, OverlayHandle } from "@oh-my-pi/pi-tui";
-import { Input, Loader, Spacer, Text } from "@oh-my-pi/pi-tui";
+import { Input, Loader, Spacer, setTuiTight, Text } from "@oh-my-pi/pi-tui";
 import { getAgentDbPath, getProjectDir, normalizePathForComparison } from "@oh-my-pi/pi-utils";
 import { formatModelSelectorValue } from "../../config/model-resolver";
 import { getRoleInfo } from "../../config/model-roles";
@@ -27,7 +27,7 @@ import {
 	theme,
 } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
-import type { ResetCreditRedeemOutcome } from "../../session/auth-storage";
+import type { ResetCreditAccountStatus, ResetCreditRedeemOutcome } from "../../session/auth-storage";
 import type { SessionInfo } from "../../session/session-listing";
 import { SessionManager } from "../../session/session-manager";
 import { FileSessionStorage } from "../../session/session-storage";
@@ -67,7 +67,6 @@ import { TranscriptBlock } from "../components/transcript-container";
 import { TreeSelectorComponent } from "../components/tree-selector";
 import { UserMessageSelectorComponent } from "../components/user-message-selector";
 import type { SessionObserverRegistry } from "../session-observer-registry";
-import { computeContextBreakdown } from "../utils/context-usage";
 import { buildCopyTargets } from "../utils/copy-targets";
 
 const MANUAL_LOGIN_TIP = "Tip: You can complete pairing with /login <redirect URL>.";
@@ -321,10 +320,27 @@ export class SelectorController {
 				for (const child of this.ctx.chatContainer.children) {
 					if (child instanceof AssistantMessageComponent) {
 						child.setHideThinkingBlock(value as boolean);
-						child.invalidate();
 					}
 				}
+				// Full clear + replay so blocks frozen in committed scrollback on
+				// ED3-risk terminals retire their stale snapshots too (see
+				// InputController.toggleThinkingBlockVisibility).
+				this.ctx.ui.resetDisplay();
 				break;
+			case "display.cacheMissMarker":
+				// Rebuild re-runs the usage-based detection under the new setting so
+				// markers appear/disappear; full reset retires any already committed
+				// to native scrollback (mirrors hideThinking).
+				this.ctx.rebuildChatFromMessages();
+				this.ctx.ui.resetDisplay();
+				break;
+			case "tui.tight":
+				setTuiTight(value as boolean);
+				this.ctx.ui.invalidate();
+				this.ctx.updateEditorTopBorder();
+				this.ctx.ui.requestRender();
+				break;
+
 			case "theme": {
 				setTheme(value as string, true).then(result => {
 					this.ctx.statusLine.invalidate();
@@ -380,6 +396,7 @@ export class SelectorController {
 				this.ctx.session.agent.repetitionPenalty = repetitionPenalty >= 0 ? repetitionPenalty : undefined;
 				break;
 			}
+			case "git.enabled":
 			case "statusLinePreset":
 			case "statusLine.preset":
 			case "statusLineSeparator":
@@ -443,7 +460,7 @@ export class SelectorController {
 	}
 
 	showModelSelector(options?: { temporaryOnly?: boolean }): void {
-		const currentContextTokens = computeContextBreakdown(this.ctx.session).usedTokens;
+		const currentContextTokens = this.ctx.session.getContextUsage()?.tokens ?? 0;
 		this.showSelector(done => {
 			const selector = new ModelSelectorComponent(
 				this.ctx.ui,
@@ -1144,7 +1161,7 @@ export class SelectorController {
 	async showResetUsageSelector(): Promise<void> {
 		const session = this.ctx.session;
 		this.ctx.showStatus("Checking saved rate-limit resets…", { dim: true });
-		let statuses: Awaited<ReturnType<typeof session.listResetCredits>>;
+		let statuses: ResetCreditAccountStatus[];
 		try {
 			statuses = await session.listResetCredits();
 		} catch (error) {

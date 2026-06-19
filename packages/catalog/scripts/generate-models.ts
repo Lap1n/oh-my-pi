@@ -10,11 +10,12 @@ const COPILOT_PREMIUM_MULTIPLIERS: Record<string, number> = {
 };
 
 import * as path from "node:path";
-import { AuthStorage, type OAuthAccess, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
+import { discoverAuthStorage } from "@oh-my-pi/pi-ai/auth-broker/discover";
+import type { OAuthAccess } from "@oh-my-pi/pi-ai/auth-storage";
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
 import { getGitLabDuoModels } from "@oh-my-pi/pi-ai/providers/gitlab-duo";
 import { $env } from "@oh-my-pi/pi-utils";
-import { fetchAntigravityDiscoveryModels } from "../src/discovery/antigravity";
+import { ANTIGRAVITY_PRIMARY_ENDPOINT, fetchAntigravityDiscoveryModels } from "../src/discovery/antigravity";
 import { fetchCodexModels } from "../src/discovery/codex";
 import { createModelManager } from "../src/model-manager";
 import prevModelsJson from "../src/models.json" with { type: "json" };
@@ -69,10 +70,8 @@ async function resolveProviderApiKey(providerId: string, catalog: CatalogDiscove
 	}
 
 	try {
-		const store = await SqliteAuthCredentialStore.open();
-		const authStorage = new AuthStorage(store);
+		const authStorage = await discoverAuthStorage();
 		try {
-			await authStorage.reload();
 			const storedApiKey = await authStorage.getApiKey(providerId);
 			if (storedApiKey) {
 				return storedApiKey;
@@ -88,10 +87,13 @@ async function resolveProviderApiKey(providerId: string, catalog: CatalogDiscove
 				}
 			}
 		} finally {
-			store.close();
+			authStorage.close();
 		}
-	} catch {
-		// Ignore missing/unreadable auth storage.
+	} catch (err) {
+		console.warn(
+			`Warning: Failed to retrieve credentials for ${providerId}:`,
+			err instanceof Error ? err.message : String(err),
+		);
 	}
 
 	return undefined;
@@ -323,23 +325,38 @@ function dropXiaomiAudioOnlyIds(models: readonly ModelSpec[]): ModelSpec[] {
 	});
 }
 
-const ANTIGRAVITY_ENDPOINT = "https://daily-cloudcode-pa.sandbox.googleapis.com";
+function normalizeAntigravityEndpoint(models: readonly ModelSpec[]): ModelSpec[] {
+	return models.map(model => {
+		if (model.provider === "google-antigravity" && model.baseUrl) {
+			return { ...model, baseUrl: ANTIGRAVITY_PRIMARY_ENDPOINT };
+		}
+		return model;
+	});
+}
+
+const ANTIGRAVITY_ENDPOINT = ANTIGRAVITY_PRIMARY_ENDPOINT;
 
 async function getOAuthAccessFromStorage(provider: OAuthProvider): Promise<OAuthAccess | null> {
 	try {
-		const store = await SqliteAuthCredentialStore.open();
-		const authStorage = new AuthStorage(store);
+		const authStorage = await discoverAuthStorage();
 		try {
-			await authStorage.reload();
 			// `getOAuthAccess` runs the full AuthStorage refresh pipeline so an
 			// expired-but-refreshable credential gets rotated before discovery,
 			// and identity metadata (accountId/projectId/email) flows through
 			// for Codex/Antigravity downstream calls.
-			return (await authStorage.getOAuthAccess(provider)) ?? null;
+			let access = await authStorage.getOAuthAccess(provider);
+			if (!access && provider === "google-antigravity") {
+				access = await authStorage.getOAuthAccess("google-gemini-cli");
+			}
+			return access ?? null;
 		} finally {
-			store.close();
+			authStorage.close();
 		}
-	} catch {
+	} catch (err) {
+		console.warn(
+			`Warning: Failed to retrieve credentials for ${provider}:`,
+			err instanceof Error ? err.message : String(err),
+		);
 		return null;
 	}
 }
@@ -351,7 +368,8 @@ async function getOAuthAccessFromStorage(provider: OAuthProvider): Promise<OAuth
 async function fetchAntigravityModels(): Promise<ModelSpec<"google-gemini-cli">[]> {
 	const access = await getOAuthAccessFromStorage("google-antigravity");
 	if (!access) {
-		console.log("No Antigravity credentials found, will use previous models");
+		console.log("No Antigravity or Gemini CLI credentials found, will use previous models.");
+		console.log("Tip: If you are logged in under a specific profile, run with OMP_PROFILE=<name>.");
 		return [];
 	}
 	try {
@@ -395,6 +413,8 @@ function extractCodexAccountId(accessToken: string): string | null {
 async function fetchCodexDiscoveryModels(): Promise<ModelSpec<"openai-codex-responses">[]> {
 	const access = await getOAuthAccessFromStorage("openai-codex");
 	if (!access) {
+		console.log("No Codex credentials found, will use previous models.");
+		console.log("Tip: If you are logged in under a specific profile, run with OMP_PROFILE=<name>.");
 		return [];
 	}
 	try {
@@ -522,6 +542,7 @@ async function generateModels() {
 	allModels = dropFireworksWireIds(allModels);
 	allModels = dropUnusableZaiContextTierIds(allModels);
 	allModels = dropXiaomiAudioOnlyIds(allModels);
+	allModels = normalizeAntigravityEndpoint(allModels);
 	// Normalize display names: gateway author prefixes ("OpenAI: …"), alias
 	// markers ("(latest)"), provider attribution ("(Antigravity)"), and
 	// price/promo tags are model-extrinsic — strip them from the bundle.
