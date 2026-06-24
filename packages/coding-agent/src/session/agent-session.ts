@@ -2378,6 +2378,28 @@ export class AgentSession {
 
 	/** Emit an event to all listeners */
 	#emit(event: AgentSessionEvent): void {
+		// Persist `agent_end` to the session JSONL so out-of-process
+		// subscribers (status bars, tailers) can detect "session is idle"
+		// without re-implementing the in-flight-prompt bookkeeping that
+		// #emitSessionEvent already does. This fires exactly once per
+		// settled agent loop — either via the immediate path in
+		// #emitSessionEvent or the deferred #flushPendingAgentEnd path.
+		// Both routes funnel through this single #emit chokepoint, so
+		// patching here covers them with one line of intent.
+		if (event.type === "agent_end") {
+			try {
+				// `appendCustomEntry` (not `appendCustomMessageEntry`) —
+				// "custom_message" entries get fed back to the LLM via
+				// convertToLlm(); "custom" entries are display-only and
+				// never enter prompt context. We only want a JSONL marker
+				// for out-of-process subscribers, not a phantom user msg.
+				this.sessionManager.appendCustomEntry("agent_end");
+			} catch (err) {
+				logger.warn("agent_end persistence failed", {
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
 		// Copy array before iteration to avoid mutation during iteration.
 		const listeners = [...this.#eventListeners];
 		for (const l of listeners) {
