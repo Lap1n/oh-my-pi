@@ -10,11 +10,14 @@ import {
 	DELETE_TAKES_NO_BODY,
 	EMPTY_BLOCK,
 	EMPTY_INSERT,
+	MINUS_BULLET_AUTO_PIPED_WARNING,
 	MINUS_ROW_REJECTED,
+	MOVE_TAKES_NO_BODY,
+	REM_TAKES_NO_BODY,
 } from "./messages";
 import { stripOneLeadingHashlinePrefix } from "./prefixes";
 import { type BlockTarget, cloneCursor, type ParsedRange, type Token, Tokenizer } from "./tokenizer";
-import type { Anchor, Cursor, Edit } from "./types";
+import type { Anchor, Cursor, Edit, FileOp } from "./types";
 
 function validateRangeOrder(range: ParsedRange, lineNum: number): void {
 	if (range.end.line < range.start.line) {
@@ -40,6 +43,13 @@ function isSkippableCommentLine(line: string): boolean {
  * dict/YAML body rather than read-output paste.
  */
 const BARE_LITERAL_VALUE_RE = /^\s*(?:"[^"]*"|'[^']*'|[-+]?\d+(?:\.\d+)?)\s*,?\s*$/;
+
+/**
+ * Markdown-bullet shape: optional indent, `-`, exactly one space, then
+ * content. Unified-diff `-` rows almost never match — code lines get the `-`
+ * glued on (`-old()`) and indented deletions carry multiple spaces (`-    x`).
+ */
+const MD_BULLET_ROW_RE = /^\s*- \S/;
 
 function detectApplyPatchContamination(text: string, _hasPending: boolean): string | null {
 	const trimmed = text.trimStart();
@@ -91,7 +101,7 @@ interface PendingComment {
 	text: string;
 }
 
-type PayloadRow = { kind: "literal"; text: string; lineNum: number; bare?: boolean };
+type PayloadRow = { kind: "literal"; text: string; lineNum: number; bare?: boolean; minus?: boolean };
 
 interface Pending {
 	target: BlockTarget;
@@ -110,6 +120,7 @@ export class Executor {
 	#warnings: string[] = [];
 	#editIndex = 0;
 	#pending: Pending | undefined;
+	#fileOp: FileOp | undefined;
 	#terminated = false;
 	#skippableComments: PendingComment[] = [];
 
@@ -161,27 +172,47 @@ export class Executor {
 				if (token.target.kind === "replace" || token.target.kind === "delete") {
 					validateRangeOrder(token.target.range, token.lineNum);
 				}
+				if (token.target.kind === "rem") {
+					this.#flushPending();
+					this.#setFileOp({ kind: "rem" }, token.lineNum);
+					return;
+				}
+				if (token.target.kind === "move") {
+					this.#flushPending();
+					this.#setFileOp({ kind: "move", dest: token.target.dest }, token.lineNum);
+					return;
+				}
 				this.#flushPending();
 				this.#pending = { target: token.target, lineNum: token.lineNum, payloads: [], deferredBlanks: [] };
 				return;
 		}
 	}
 
-	end(): { edits: Edit[]; warnings: string[] } {
+	end(): { edits: Edit[]; fileOp?: FileOp; warnings: string[] } {
 		this.#consumePendingSkippableComments();
 		this.#flushPending();
+		this.#validateFileOp();
 		this.#validateNoOverlappingDeletes();
-		return { edits: this.#edits, warnings: this.#warnings };
+		return {
+			edits: this.#edits,
+			...(this.#fileOp === undefined ? {} : { fileOp: this.#fileOp }),
+			warnings: this.#warnings,
+		};
 	}
 
-	endStreaming(): { edits: Edit[]; warnings: string[] } {
+	endStreaming(): { edits: Edit[]; fileOp?: FileOp; warnings: string[] } {
 		this.#consumePendingSkippableComments();
 		if (this.#pending && this.#pending.payloads.length > 0) this.#flushPending();
 		else if (this.#pending?.target.kind === "delete" || this.#pending?.target.kind === "delete_block")
 			this.#flushPending();
 		else this.#pending = undefined;
+		this.#validateFileOp();
 		this.#validateNoOverlappingDeletes();
-		return { edits: this.#edits, warnings: this.#warnings };
+		return {
+			edits: this.#edits,
+			...(this.#fileOp === undefined ? {} : { fileOp: this.#fileOp }),
+			warnings: this.#warnings,
+		};
 	}
 
 	reset(): void {
@@ -189,8 +220,28 @@ export class Executor {
 		this.#warnings = [];
 		this.#editIndex = 0;
 		this.#pending = undefined;
+		this.#fileOp = undefined;
 		this.#skippableComments = [];
 		this.#terminated = false;
+	}
+
+	#setFileOp(fileOp: FileOp, lineNum: number): void {
+		if (this.#fileOp !== undefined) {
+			throw new Error(
+				`line ${lineNum}: only one file-level op (\`REM\` or \`MV\`) per section. Merge them under one header.`,
+			);
+		}
+		if (fileOp.kind === "rem" && this.#edits.length > 0) {
+			throw new Error(`line ${lineNum}: ${REM_TAKES_NO_BODY}`);
+		}
+		this.#fileOp = fileOp;
+	}
+
+	#validateFileOp(): void {
+		if (this.#fileOp?.kind !== "rem") return;
+		if (this.#edits.length > 0) {
+			throw new Error("`REM` deletes the whole file and cannot be combined with line ops.");
+		}
 	}
 
 	#validateNoOverlappingDeletes(): void {
@@ -217,6 +268,7 @@ export class Executor {
 	#handleLiteralPayload(text: string, lineNum: number): void {
 		const pending = this.#pending;
 		if (!pending) {
+			if (this.#fileOp !== undefined) throw new Error(`line ${lineNum}: ${MOVE_TAKES_NO_BODY}`);
 			throw new Error(
 				`line ${lineNum}: payload line has no preceding hunk header. ` +
 					`Got ${JSON.stringify(`${HL_PAYLOAD_REPLACE}${text}`)}.`,
@@ -231,6 +283,7 @@ export class Executor {
 	#handleRaw(text: string, lineNum: number): void {
 		const contamination = detectApplyPatchContamination(text, this.#pending !== undefined);
 		if (contamination !== null) throw new Error(`line ${lineNum}: ${contamination}`);
+		if (this.#fileOp !== undefined) throw new Error(`line ${lineNum}: ${MOVE_TAKES_NO_BODY}`);
 		if (this.#pending) {
 			if (text.trim().length === 0) {
 				this.#handleBlank(text, lineNum);
@@ -239,8 +292,12 @@ export class Executor {
 			if (this.#pending.target.kind === "delete") throw new Error(`line ${lineNum}: ${DELETE_TAKES_NO_BODY}`);
 			if (this.#pending.target.kind === "delete_block")
 				throw new Error(`line ${lineNum}: ${DELETE_BLOCK_TAKES_NO_BODY}`);
-			if (text.trimStart().charCodeAt(0) === 45 /* - */) throw new Error(`line ${lineNum}: ${MINUS_ROW_REJECTED}`);
-			if (!this.#warnings.includes(BARE_BODY_AUTO_PIPED_WARNING)) this.#warnings.push(BARE_BODY_AUTO_PIPED_WARNING);
+			const row: PayloadRow = { kind: "literal", text, lineNum, bare: true };
+			// `-` rows are held and judged at flush time by #resolveMinusRows,
+			// once the whole body is visible.
+			if (text.trimStart().charCodeAt(0) === 45 /* - */) row.minus = true;
+			else if (!this.#warnings.includes(BARE_BODY_AUTO_PIPED_WARNING))
+				this.#warnings.push(BARE_BODY_AUTO_PIPED_WARNING);
 			this.#commitDeferredBlanks(this.#pending);
 			// Defer read-output line-number stripping to #flushPending: a bare
 			// "N:text" row is only a copy-paste artifact from snapshot output
@@ -249,7 +306,7 @@ export class Executor {
 			// with "digits:" (YAML ports "42:hello", timestamps "12:30") when it
 			// sits next to an unprefixed sibling. Rows with an explicit "+" go
 			// through #handleLiteralPayload and are never bare, never stripped.
-			this.#pending.payloads.push({ kind: "literal", text, lineNum, bare: true });
+			this.#pending.payloads.push(row);
 			return;
 		}
 		if (text.trim().length === 0) return;
@@ -279,6 +336,38 @@ export class Executor {
 		if (!this.#warnings.includes(BARE_BODY_AUTO_PIPED_WARNING)) this.#warnings.push(BARE_BODY_AUTO_PIPED_WARNING);
 		pending.payloads.push(...pending.deferredBlanks);
 		pending.deferredBlanks = [];
+	}
+
+	/**
+	 * Judge bare `-` body rows once the whole hunk body is known. They are
+	 * usually unified-diff contamination (`-old` next to `+new`) and inserting
+	 * them would corrupt the file, so they are rejected — EXCEPT when the body
+	 * is unambiguously a Markdown bullet list: every `-` row is bullet-shaped
+	 * (`- item`) and the body is either fully bare or already contains an
+	 * explicit `+- item` sibling. Those rows are kept as literal content with a
+	 * warning instead of failing the patch.
+	 */
+	#resolveMinusRows(payloads: readonly PayloadRow[]): void {
+		let firstMinus: PayloadRow | undefined;
+		let allBulletShaped = true;
+		let hasExplicit = false;
+		let hasExplicitBullet = false;
+		for (const row of payloads) {
+			if (row.minus) {
+				firstMinus ??= row;
+				allBulletShaped &&= MD_BULLET_ROW_RE.test(row.text);
+			} else if (!row.bare) {
+				hasExplicit = true;
+				hasExplicitBullet ||= MD_BULLET_ROW_RE.test(row.text);
+			}
+		}
+		if (firstMinus === undefined) return;
+		if (allBulletShaped && (!hasExplicit || hasExplicitBullet)) {
+			if (!this.#warnings.includes(MINUS_BULLET_AUTO_PIPED_WARNING))
+				this.#warnings.push(MINUS_BULLET_AUTO_PIPED_WARNING);
+			return;
+		}
+		throw new Error(`line ${firstMinus.lineNum}: ${MINUS_ROW_REJECTED}`);
 	}
 
 	/**
@@ -343,6 +432,7 @@ export class Executor {
 		const pending = this.#pending;
 		if (!pending) return;
 		const { target, lineNum, payloads } = pending;
+		this.#resolveMinusRows(payloads);
 		this.#stripBarePrefixesIfUniform(payloads);
 		this.#pending = undefined;
 		if (target.kind === "delete") {
@@ -390,19 +480,19 @@ export class Executor {
 	}
 }
 
-function drain(executor: Executor, tokenizer: Tokenizer): { edits: Edit[]; warnings: string[] } {
+function drain(executor: Executor, tokenizer: Tokenizer): { edits: Edit[]; fileOp?: FileOp; warnings: string[] } {
 	for (const token of tokenizer.end()) executor.feed(token);
 	return executor.end();
 }
 
-export function parsePatch(diff: string): { edits: Edit[]; warnings: string[] } {
+export function parsePatch(diff: string): { edits: Edit[]; fileOp?: FileOp; warnings: string[] } {
 	const tokenizer = new Tokenizer();
 	const executor = new Executor();
 	for (const token of tokenizer.feed(diff)) executor.feed(token);
 	return drain(executor, tokenizer);
 }
 
-export function parsePatchStreaming(diff: string): { edits: Edit[]; warnings: string[] } {
+export function parsePatchStreaming(diff: string): { edits: Edit[]; fileOp?: FileOp; warnings: string[] } {
 	const tokenizer = new Tokenizer();
 	const executor = new Executor();
 	for (const token of tokenizer.feed(diff)) executor.feed(token);

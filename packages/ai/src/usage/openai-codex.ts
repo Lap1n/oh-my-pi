@@ -1,5 +1,4 @@
 import { Buffer } from "node:buffer";
-import { CODEX_BASE_URL } from "@oh-my-pi/pi-catalog/wire/codex";
 import type {
 	CredentialRankingStrategy,
 	UsageAmount,
@@ -12,6 +11,8 @@ import type {
 	UsageWindow,
 } from "../usage";
 import { isRecord } from "../utils";
+import { normalizeCodexBaseUrl } from "./openai-codex-base-url";
+import { listCodexResetCredits } from "./openai-codex-reset";
 import { toNumber } from "./shared";
 
 const CODEX_USAGE_PATH = "wham/usage";
@@ -200,20 +201,6 @@ function parseResetCredits(payload: unknown): UsageResetCredits | undefined {
 	return { availableCount: Math.max(0, Math.trunc(availableCount)) };
 }
 
-export function normalizeCodexBaseUrl(baseUrl?: string): string {
-	const fallback = CODEX_BASE_URL;
-	const trimmed = baseUrl?.trim() ? baseUrl.trim() : fallback;
-	const base = trimmed.replace(/\/+$/, "");
-	const lower = base.toLowerCase();
-	if (
-		(lower.startsWith("https://chatgpt.com") || lower.startsWith("https://chat.openai.com")) &&
-		!lower.includes("/backend-api")
-	) {
-		return `${base}/backend-api`;
-	}
-	return base;
-}
-
 function buildCodexUsageUrl(baseUrl: string): string {
 	const normalized = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
 	return `${normalized}${CODEX_USAGE_PATH}`;
@@ -298,8 +285,6 @@ function buildUsageLimit(args: {
 		label: usageWindow.label,
 		scope: {
 			provider: "openai-codex",
-			accountId: args.accountId,
-			tier: args.planType,
 			windowId: usageWindow.id,
 			shared: true,
 		},
@@ -359,11 +344,44 @@ function buildAdditionalUsageLimit(args: {
 	};
 }
 
+/**
+ * Parse Codex `x-codex-{primary,secondary}-*` rate-limit response headers into
+ * a usage report. The backend attaches these snapshots to every response, so
+ * ingesting them lets credential selection block an exhausted account before
+ * the next request burns a wire 429.
+ */
+export function parseCodexRateLimitHeaders(headers: Record<string, string>, now = Date.now()): UsageReport | null {
+	const parseWindow = (key: "primary" | "secondary"): ParsedUsageWindow | undefined => {
+		const usedPercent = toNumber(headers[`x-codex-${key}-used-percent`]);
+		if (usedPercent === undefined) return undefined;
+		const windowMinutes = toNumber(headers[`x-codex-${key}-window-minutes`]);
+		const resetAt = toNumber(headers[`x-codex-${key}-reset-at`]);
+		return {
+			usedPercent,
+			limitWindowSeconds: windowMinutes === undefined ? undefined : windowMinutes * 60,
+			resetAt,
+		};
+	};
+	const primary = parseWindow("primary");
+	const secondary = parseWindow("secondary");
+	if (!primary && !secondary) return null;
+	const limits: UsageLimit[] = [];
+	if (primary) limits.push(buildUsageLimit({ key: "primary", window: primary, nowMs: now }));
+	if (secondary) limits.push(buildUsageLimit({ key: "secondary", window: secondary, nowMs: now }));
+	return {
+		provider: "openai-codex",
+		fetchedAt: now,
+		limits,
+		metadata: { source: "ratelimit-headers" },
+	};
+}
+
 export const openaiCodexUsageProvider: UsageProvider = {
 	id: "openai-codex",
 	supports(params: UsageFetchParams): boolean {
 		return params.provider === "openai-codex" && params.credential.type === "oauth";
 	},
+	parseRateLimitHeaders: parseCodexRateLimitHeaders,
 	async fetchUsage(params: UsageFetchParams, ctx: UsageFetchContext): Promise<UsageReport | null> {
 		if (params.provider !== "openai-codex") return null;
 		const { credential } = params;
@@ -470,6 +488,34 @@ export const openaiCodexUsageProvider: UsageProvider = {
 		}
 
 		const resetCredits = parseResetCredits(payload);
+		if (resetCredits && resetCredits.availableCount > 0) {
+			try {
+				const list = await listCodexResetCredits({
+					accessToken,
+					accountId,
+					baseUrl: params.baseUrl,
+					fetch: ctx.fetch,
+					signal: params.signal,
+				});
+				if (list?.credits.length) {
+					resetCredits.credits = list.credits
+						.filter(c => (c.status ?? "available") === "available")
+						.map(c => ({
+							grantedAt: c.grantedAt,
+							expiresAt: c.expiresAt,
+							status: c.status,
+						}));
+				}
+				// Always sync the live count from the detail endpoint — it may report
+				// fewer or zero available credits after expiry/redeem, even when the
+				// /wham/usage payload still has a stale count.
+				if (list) {
+					resetCredits.availableCount = list.availableCount;
+				}
+			} catch (error) {
+				ctx.logger?.warn("Codex reset credits detail fetch failed", { error: String(error) });
+			}
+		}
 		const report: UsageReport = {
 			provider: "openai-codex",
 			fetchedAt: nowMs,
@@ -492,6 +538,9 @@ export const openaiCodexUsageProvider: UsageProvider = {
 const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
 
 export const codexRankingStrategy: CredentialRankingStrategy = {
+	blockScope() {
+		return "shared";
+	},
 	findWindowLimits(report) {
 		const findLimit = (key: "primary" | "secondary"): UsageLimit | undefined => {
 			const direct = report.limits.find(l => l.id === `openai-codex:${key}`);

@@ -3,13 +3,20 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
-import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
+import {
+	calculateCost,
+	getBundledModel,
+	getBundledModels,
+	getBundledProviders,
+	modelsAreEqual,
+} from "@oh-my-pi/pi-catalog/models";
 import {
 	__resetLegacyPiResolutionCache,
 	installLegacyPiSpecifierShim,
 	loadLegacyPiModule,
 } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/legacy-pi-compat";
 import { Type as TypeBoxShimType } from "@oh-my-pi/pi-coding-agent/extensibility/typebox";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 // pi-ai 15.1.0 removed the runtime `Type` export from `@oh-my-pi/pi-ai`'s
 // package root. Legacy extensions (and their aliased-scope variants such as
@@ -29,7 +36,7 @@ afterEach(() => {
 
 afterAll(async () => {
 	for (const dir of tempRoots) {
-		await fs.rm(dir, { recursive: true, force: true });
+		await removeWithRetries(dir);
 	}
 });
 
@@ -60,6 +67,25 @@ describe("legacy-pi @(scope)/pi-ai root `Type` remap (issue #1437)", () => {
 		expect(loaded.schema.safeParse({ name: "ok" }).success).toBe(true);
 		expect(loaded.schema.safeParse({}).success).toBe(false);
 		expect(loaded.schema.safeParse({ name: "ok", extra: 1 }).success).toBe(false);
+	});
+
+	it("redirects the legacy pi-ai compat entrypoint through the root compatibility shim", async () => {
+		const entry = await writeFixtureExtension(
+			[
+				'import { StringEnum, complete, type Model } from "@earendil-works/pi-ai/compat";',
+				'export const schema = StringEnum(["red", "green"] as const);',
+				"export const completeType = typeof complete;",
+				"export type LegacyModel = Model;",
+			].join("\n"),
+		);
+
+		const loaded = (await loadLegacyPiModule(entry)) as {
+			schema: { safeParse: (input: unknown) => { success: boolean } };
+			completeType: string;
+		};
+		expect(loaded.schema.safeParse("red").success).toBe(true);
+		expect(loaded.schema.safeParse("blue").success).toBe(false);
+		expect(loaded.completeType).toBe("function");
 	});
 
 	it('redirects `import { Type } from "@oh-my-pi/pi-ai"` for plugins published against the canonical scope', async () => {
@@ -123,6 +149,49 @@ describe("legacy-pi @(scope)/pi-ai root `Type` remap (issue #1437)", () => {
 		expect(loaded.testGetModels).toBe(getBundledModels);
 	});
 
+	it("re-exports calculateCost from @oh-my-pi/pi-catalog/models (issue #4584)", async () => {
+		// `calculateCost` was moved from the `@oh-my-pi/pi-ai` barrel to
+		// `@oh-my-pi/pi-catalog/models` in the catalog split. Legacy extensions
+		// still import it from the pi-ai root, so the shim must bridge it back
+		// to the catalog implementation. The historical regression was a plain
+		// `SyntaxError: Export named 'calculateCost' not found in module
+		// '.../legacy-pi-ai-shim.ts'` at extension-validation time.
+		const loaded = (await loadLegacyPiModule(
+			await writeFixtureExtension(
+				'import { calculateCost } from "@oh-my-pi/pi-ai"; export const probe = calculateCost;',
+			),
+		)) as { probe: unknown };
+		expect(loaded.probe).toBe(calculateCost);
+	});
+
+	it("re-exports modelsAreEqual and getBundledProviders from @oh-my-pi/pi-catalog/models", async () => {
+		const loaded = (await loadLegacyPiModule(
+			await writeFixtureExtension(
+				[
+					'import { modelsAreEqual, getBundledProviders } from "@oh-my-pi/pi-ai";',
+					"export const eq = modelsAreEqual;",
+					"export const providers = getBundledProviders;",
+				].join("\n"),
+			),
+		)) as { eq: unknown; providers: unknown };
+		expect(loaded.eq).toBe(modelsAreEqual);
+		expect(loaded.providers).toBe(getBundledProviders);
+	});
+
+	it("re-exports getBundledModel and getBundledModels from @oh-my-pi/pi-catalog/models", async () => {
+		const loaded = (await loadLegacyPiModule(
+			await writeFixtureExtension(
+				[
+					'import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-ai";',
+					"export const model = getBundledModel;",
+					"export const models = getBundledModels;",
+				].join("\n"),
+			),
+		)) as { model: unknown; models: unknown };
+		expect(loaded.model).toBe(getBundledModel);
+		expect(loaded.models).toBe(getBundledModels);
+	});
+
 	it("exports StringEnum as a schema builder with options support", async () => {
 		const loaded = (await loadLegacyPiModule(
 			await writeFixtureExtension(
@@ -156,6 +225,30 @@ describe("legacy pi package root remaps (issue #1474)", () => {
 
 		const loaded = (await loadLegacyPiModule(entry)) as { loadedVersion: string };
 		expect(loaded.loadedVersion).toMatch(/^\d+\.\d+\.\d+/);
+	});
+
+	it("loads pi-vimmode's minified legacy imports", async () => {
+		const entry = await writeFixtureExtension(
+			[
+				'import{CustomEditor,copyToClipboard}from"@earendil-works/pi-coding-agent";',
+				'import{CURSOR_MARKER,decodeKittyPrintable,matchesKey,parseKey,truncateToWidth,visibleWidth}from"@earendil-works/pi-tui";',
+				"export const apiTypes=[typeof CustomEditor,typeof copyToClipboard,typeof CURSOR_MARKER,typeof decodeKittyPrintable,typeof matchesKey,typeof parseKey,typeof truncateToWidth,typeof visibleWidth];",
+				'export const printable=decodeKittyPrintable("\\x1b[97u");',
+			].join("\n"),
+		);
+
+		const loaded = (await loadLegacyPiModule(entry)) as { apiTypes: string[]; printable: string };
+		expect(loaded.apiTypes).toEqual([
+			"function",
+			"function",
+			"string",
+			"function",
+			"function",
+			"function",
+			"function",
+			"function",
+		]);
+		expect(loaded.printable).toBe("a");
 	});
 
 	it("preserves legacy defineTool root imports and usable coding tools", async () => {

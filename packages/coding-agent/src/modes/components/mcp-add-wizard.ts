@@ -15,7 +15,7 @@ import {
 } from "@oh-my-pi/pi-tui";
 import { getMCPConfigPath, getProjectDir } from "@oh-my-pi/pi-utils";
 import { validateServerName } from "../../mcp/config-writer";
-import { analyzeAuthError, discoverOAuthEndpoints } from "../../mcp/oauth-discovery";
+import { analyzeAuthError, discoverOAuthEndpoints, fetchResourceMetadataScopes } from "../../mcp/oauth-discovery";
 import type { MCPHttpServerConfig, MCPServerConfig, MCPSseServerConfig, MCPStdioServerConfig } from "../../mcp/types";
 import { shortenPath } from "../../tools/render-utils";
 import { theme } from "../theme/theme";
@@ -64,6 +64,14 @@ interface MCPAddWizardOAuthOptions {
 	serverUrl?: string;
 	resource?: string;
 	registrationUrl?: string;
+	/**
+	 * External cancellation source. Aborting it tears down the in-flight OAuth
+	 * flow and surfaces a neutral cancellation error. The wizard wires its own
+	 * controller here so Esc cancels the OAuth wait instead of stepping back
+	 * through the form (the wizard is focused, so the editor's Esc hook does
+	 * not fire).
+	 */
+	abortSignal?: AbortSignal;
 }
 
 interface WizardState {
@@ -75,11 +83,11 @@ interface WizardState {
 	authMethod: AuthMethod;
 	oauthAuthUrl: string;
 	oauthTokenUrl: string;
+	oauthRegistrationUrl: string;
 	oauthClientId: string;
 	oauthClientSecret: string;
 	oauthScopes: string;
 	oauthResource: string;
-	oauthRegistrationUrl: string;
 	oauthCredentialId: string | null;
 	apiKey: string;
 	authLocation: AuthLocation | null;
@@ -107,11 +115,11 @@ export class MCPAddWizard extends Container {
 		authMethod: "none",
 		oauthAuthUrl: "",
 		oauthTokenUrl: "",
+		oauthRegistrationUrl: "",
 		oauthClientId: "",
 		oauthClientSecret: "",
 		oauthScopes: "",
 		oauthResource: "",
-		oauthRegistrationUrl: "",
 		oauthCredentialId: null,
 		apiKey: "",
 		authLocation: null,
@@ -138,6 +146,12 @@ export class MCPAddWizard extends Container {
 		| null = null;
 	#onTestConnectionCallback: ((config: MCPServerConfig) => Promise<void>) | null = null;
 	#onRenderCallback: (() => void) | null = null;
+	/**
+	 * Set while the OAuth callback is in flight; populated by
+	 * {@link #launchOAuthFlow} and consumed by {@link handleInput} so Esc
+	 * cancels the OAuth wait instead of stepping back through the form.
+	 */
+	#oauthAbort: AbortController | null = null;
 
 	constructor(
 		onComplete: (name: string, config: MCPServerConfig, scope: Scope) => void,
@@ -476,6 +490,15 @@ export class MCPAddWizard extends Container {
 	}
 
 	handleInput(keyData: string): void {
+		// While an OAuth callback is being awaited, Esc/Ctrl+C aborts the flow
+		// rather than stepping back through the form: the wizard advertises
+		// "(Press Esc to cancel)" during the wait, and stepping back would
+		// leave the OAuth login orphaned.
+		if (this.#oauthAbort && (keyData === "\x03" || matchesAppInterrupt(keyData))) {
+			this.#oauthAbort.abort("MCP OAuth flow cancelled by user");
+			return;
+		}
+
 		// Handle Ctrl+C to cancel wizard immediately
 		if (keyData === "\x03") {
 			// Ctrl+C pressed - cancel wizard
@@ -989,19 +1012,27 @@ export class MCPAddWizard extends Container {
 							this.#state.url,
 							authResult.authServerUrl,
 							authResult.resourceMetadataUrl,
+							{ protectedScopes: authResult.scopes },
 						);
 					} catch {
 						// Ignore discovery failures and fallback to manual auth.
 					}
 				}
+				if (oauth && !oauth.scopes && authResult.resourceMetadataUrl) {
+					// JSON-error-body path skips `discoverOAuthEndpoints` when the body
+					// already carries endpoints, so scopes advertised only in the
+					// protected-resource metadata document never reach the grant.
+					const scopes = await fetchResourceMetadataScopes(authResult.resourceMetadataUrl);
+					if (scopes) oauth = { ...oauth, scopes };
+				}
 
 				if (oauth) {
 					this.#state.oauthAuthUrl = oauth.authorizationUrl;
 					this.#state.oauthTokenUrl = oauth.tokenUrl;
+					this.#state.oauthRegistrationUrl = oauth.registrationUrl || "";
 					this.#state.oauthClientId = oauth.clientId || "";
 					this.#state.oauthScopes = oauth.scopes || "";
 					this.#state.oauthResource = oauth.resource || (this.#state.transport === "stdio" ? "" : this.#state.url);
-					this.#state.oauthRegistrationUrl = oauth.registrationUrl || "";
 					this.#state.authMethod = "oauth";
 
 					this.#contentContainer.clear();
@@ -1157,6 +1188,7 @@ export class MCPAddWizard extends Container {
 		this.#contentContainer.addChild(new Text(theme.fg("muted", "(Press Esc to cancel)"), 0, 0));
 		this.#requestRender();
 
+		this.#oauthAbort = new AbortController();
 		try {
 			// Call OAuth handler
 			const oauthResource = this.#state.oauthResource || (this.#state.transport === "stdio" ? "" : this.#state.url);
@@ -1168,8 +1200,9 @@ export class MCPAddWizard extends Container {
 				this.#state.oauthScopes,
 				{
 					serverUrl: this.#state.url || undefined,
-					resource: oauthResource || undefined,
 					registrationUrl: this.#state.oauthRegistrationUrl || undefined,
+					resource: oauthResource || undefined,
+					abortSignal: this.#oauthAbort.signal,
 				},
 			);
 
@@ -1242,16 +1275,29 @@ export class MCPAddWizard extends Container {
 				healthPassed ? 1000 : 2000,
 			);
 		} catch (error) {
-			// Show error with options to retry or go back
+			// User cancellation has its own neutral heading + tip; everything else
+			// keeps the "OAuth authentication failed" framing so the existing tips
+			// stay meaningful. Name-matching avoids importing controller types.
+			const cancelled = error instanceof Error && error.name === "MCPOAuthCancelledError";
 			const errorMsg = sanitize(error instanceof Error ? error.message : String(error));
 			this.#contentContainer.clear();
-			this.#contentContainer.addChild(new Text(theme.fg("error", "✗ OAuth authentication failed"), 0, 0));
+			this.#contentContainer.addChild(
+				new Text(
+					cancelled ? theme.fg("muted", "○ OAuth cancelled") : theme.fg("error", "✗ OAuth authentication failed"),
+					0,
+					0,
+				),
+			);
 			this.#contentContainer.addChild(new Spacer(1));
 			this.#contentContainer.addChild(new Text(errorMsg, 0, 0));
 			this.#contentContainer.addChild(new Spacer(1));
 
 			// Provide helpful tips based on error type
-			if (errorMsg.includes("timeout") || errorMsg.includes("timed out")) {
+			if (cancelled) {
+				this.#contentContainer.addChild(
+					new Text(theme.fg("muted", "Tip: Choose Retry to launch the browser again."), 0, 0),
+				);
+			} else if (errorMsg.includes("timeout") || errorMsg.includes("timed out")) {
 				this.#contentContainer.addChild(
 					new Text(theme.fg("muted", "Tip: Complete authorization faster next time"), 0, 0),
 				);
@@ -1277,6 +1323,8 @@ export class MCPAddWizard extends Container {
 			// Set up as a selector step
 			this.#selectedIndex = 0;
 			this.#currentStep = "oauth-error";
+		} finally {
+			this.#oauthAbort = null;
 		}
 	}
 

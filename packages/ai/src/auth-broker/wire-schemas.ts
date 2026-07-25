@@ -32,6 +32,9 @@ export const oauthCredentialSchema = type({
 	"projectId?": "string",
 	"email?": "string",
 	"accountId?": "string",
+	"orgId?": "string",
+	"orgName?": "string",
+	"authorizedAt?": "number",
 });
 
 /** OAuth credential as it appears in broker snapshots — refresh replaced with sentinel. */
@@ -45,12 +48,16 @@ export const remoteOauthCredentialSchema = type({
 	"projectId?": "string",
 	"email?": "string",
 	"accountId?": "string",
+	"orgId?": "string",
+	"orgName?": "string",
+	"authorizedAt?": "number",
 });
 
 export const apiKeyCredentialSchema = type({
 	"+": "reject",
 	type: "'api_key'",
 	key: type("string").atLeastLength(1),
+	"source?": "'login'",
 });
 
 /** Discriminated union accepted on POST /v1/credential (writes). */
@@ -69,6 +76,14 @@ export const credentialSnapshotEntrySchema = type({
 	identityKey: "string | null",
 });
 
+export const credentialBlockSnapshotSchema = type({
+	"+": "reject",
+	providerKey: type("string").atLeastLength(1),
+	blockScope: "string",
+	blockedUntilMs: "number",
+	"updatedAtMs?": "number",
+});
+
 export const snapshotEntrySchema = type({
 	"+": "reject",
 	id: "number.integer",
@@ -76,6 +91,7 @@ export const snapshotEntrySchema = type({
 	credential: snapshotCredentialSchema,
 	identityKey: "string | null",
 	rotatesInMs: "number | null",
+	"blocks?": credentialBlockSnapshotSchema.array(),
 });
 
 export const refresherScheduleSchema = type({
@@ -183,8 +199,15 @@ const usageLimitSchema = type({
 	"notes?": "string[]",
 });
 
+const usageResetCreditDetailSchema = type({
+	"grantedAt?": "string",
+	"expiresAt?": "string",
+	"status?": "string",
+});
+
 const usageResetCreditsSchema = type({
 	availableCount: "number",
+	"credits?": usageResetCreditDetailSchema.array(),
 });
 
 const arkUsageReportSchema = type({
@@ -192,6 +215,7 @@ const arkUsageReportSchema = type({
 	fetchedAt: "number",
 	limits: usageLimitSchema.array(),
 	"resetCredits?": usageResetCreditsSchema,
+	"notes?": "string[]",
 	"metadata?": { "[string]": "unknown" },
 	"raw?": "unknown",
 });
@@ -206,6 +230,77 @@ export const usageResponseSchema = type({
 	"+": "reject",
 	generatedAt: "number",
 	reports: arkUsageReportSchema.array(),
+});
+
+const usageHistoryEntrySchema = type({
+	recordedAt: "number",
+	provider: "string",
+	accountKey: "string",
+	"email?": "string",
+	"accountId?": "string",
+	limitId: "string",
+	label: "string",
+	"windowLabel?": "string",
+	"usedFraction?": "number",
+	"status?": "'ok' | 'warning' | 'exhausted' | 'unknown'",
+	"resetsAt?": "number",
+});
+
+/** Broker `/v1/usage/history` response — recorded usage-limit snapshots, oldest first. */
+export const usageHistoryResponseSchema = type({
+	"+": "reject",
+	generatedAt: "number",
+	entries: usageHistoryEntrySchema.array(),
+});
+
+const observedUsageEntrySchema = type({
+	at: "number",
+	provider: "string",
+	model: "string",
+	requests: "number",
+	inputTokens: "number",
+	outputTokens: "number",
+	cacheReadTokens: "number",
+	cacheWriteTokens: "number",
+	costUsd: "number",
+});
+
+/** Broker `POST /v1/usage/observed` request — one client's batched observed usage. */
+export const clientUsageReportRequestSchema = type({
+	"+": "reject",
+	installId: "string",
+	"hostname?": "string",
+	entries: observedUsageEntrySchema.array(),
+});
+
+export const clientUsageReportResponseSchema = type({
+	"+": "reject",
+	ok: "boolean",
+});
+
+const clientProviderUsageSchema = type({
+	provider: "string",
+	requests: "number",
+	inputTokens: "number",
+	outputTokens: "number",
+	cacheReadTokens: "number",
+	cacheWriteTokens: "number",
+	costUsd: "number",
+});
+
+const clientUsageClientSummarySchema = type({
+	installId: "string",
+	"hostname?": "string",
+	firstSeen: "number",
+	lastSeen: "number",
+	providers: clientProviderUsageSchema.array(),
+});
+
+/** Broker `GET /v1/usage/clients` response — per-client token burn aggregates. */
+export const clientUsageSummaryResponseSchema = type({
+	"+": "reject",
+	generatedAt: "number",
+	clients: clientUsageClientSummarySchema.array(),
 });
 
 // ─── Refresh ───────────────────────────────────────────────────────────────
@@ -223,6 +318,46 @@ export const credentialDisableRequestSchema = type({
 });
 
 export const credentialDisableResponseSchema = type({
+	"+": "reject",
+	ok: "boolean",
+});
+
+/** One disabled-credential tombstone — identity + cause, never token material. */
+export const disabledCredentialSummarySchema = type({
+	"+": "reject",
+	id: "number.integer",
+	provider: type("string").atLeastLength(1),
+	type: "'oauth' | 'api_key'",
+	"email?": "string",
+	"accountId?": "string",
+	"orgId?": "string",
+	"orgName?": "string",
+	cause: "string",
+	"disabledAtMs?": "number",
+});
+
+/** Broker `GET /v1/credentials/disabled` response. */
+export const disabledCredentialsResponseSchema = type({
+	"+": "reject",
+	generatedAt: "number",
+	disabled: disabledCredentialSummarySchema.array(),
+});
+
+// ─── Credential blocks ──────────────────────────────────────────────────────
+
+export const credentialBlockRequestSchema = credentialBlockSnapshotSchema;
+
+export const credentialBlockResponseSchema = type({
+	"+": "reject",
+	ok: "boolean",
+});
+
+export const credentialBlocksDeleteResponseSchema = type({
+	"+": "reject",
+	ok: "boolean",
+});
+
+export const usageStaleResponseSchema = type({
 	"+": "reject",
 	ok: "boolean",
 });

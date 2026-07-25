@@ -32,7 +32,7 @@ import {
 	clearOmpExtensionCliRoots,
 	injectOmpExtensionCliRoots,
 } from "@oh-my-pi/pi-coding-agent/discovery/omp-extension-roots";
-import { getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, removeSyncWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 
 const PROVIDER_ID = "omp-plugins";
 
@@ -108,7 +108,7 @@ afterEach(() => {
 		setAgentDir(fallbackAgentDir);
 		delete process.env.PI_CODING_AGENT_DIR;
 	}
-	fs.rmSync(tempDir, { recursive: true, force: true });
+	removeSyncWithRetries(tempDir);
 });
 
 function ctx(): LoadContext {
@@ -188,6 +188,49 @@ test(".mcp.json with bare entries (no command/url) records a warning and is skip
 	expect((result.warnings ?? []).some(w => w.includes('"broken"'))).toBe(true);
 });
 
+test("relative path-like command and cwd resolve against the plugin config directory", async () => {
+	writeFile(
+		path.join(ext, ".mcp.json"),
+		JSON.stringify({
+			mcpServers: {
+				local: { command: "./bin/server", args: ["mcp"], cwd: "." },
+				bare: { command: "npx", args: ["-y", "@some/mcp"] },
+			},
+		}),
+	);
+	writeFile(path.join(project, ".omp", "settings.json"), JSON.stringify({ extensions: [ext] }));
+
+	const servers = await loadFromPlugin<{ name: string; command?: string; cwd?: string }>(mcpCapability.id, ctx());
+	const local = servers.find(s => s.name === "local");
+	const bare = servers.find(s => s.name === "bare");
+	// Path-like command and "." cwd rebase onto the .mcp.json directory (ext),
+	// not the session cwd (project). Bare executables are left untouched.
+	expect(local?.command).toBe(path.join(ext, "bin", "server"));
+	expect(local?.cwd).toBe(ext);
+	expect(bare?.command).toBe("npx");
+	expect(bare?.cwd).toBeUndefined();
+});
+
+test("path-like command stays rooted at the plugin package root even with a subdirectory cwd", async () => {
+	// Plugin .mcp.json commands are relative to the plugin package root, not the
+	// declared cwd: a plugin may ship its executable at the root yet run from a
+	// data subdir. cwd rebases to <ext>/work but command stays <ext>/bin/server.
+	writeFile(
+		path.join(ext, ".mcp.json"),
+		JSON.stringify({
+			mcpServers: {
+				local: { command: "./bin/server", args: ["mcp"], cwd: "work" },
+			},
+		}),
+	);
+	writeFile(path.join(project, ".omp", "settings.json"), JSON.stringify({ extensions: [ext] }));
+
+	const servers = await loadFromPlugin<{ name: string; command?: string; cwd?: string }>(mcpCapability.id, ctx());
+	const local = servers.find(s => s.name === "local");
+	expect(local?.command).toBe(path.join(ext, "bin", "server"));
+	expect(local?.cwd).toBe(path.join(ext, "work"));
+});
+
 test("installed plugins under `<plugins>/node_modules/` are surfaced (e.g. via `omp plugin link`/`install`)", async () => {
 	// Simulate what `plugin install` / `plugin link` produces: a plugins root
 	// with `package.json#dependencies` and a populated `node_modules/<pkg>/`.
@@ -207,6 +250,27 @@ test("installed plugins under `<plugins>/node_modules/` are surfaced (e.g. via `
 	const skills = await loadFromPlugin<{ name: string; path: string }>(skillCapability.id, ctx());
 	const found = skills.find(s => s.name === "my-skill" && s.path.includes("my-installed-ext"));
 	expect(found).toBeDefined();
+});
+
+test("project-scoped installed plugins surface project-level sub-discovery", async () => {
+	const pluginsDir = path.join(project, ".omp", "plugins");
+	const installed = path.join(pluginsDir, "node_modules", "my-project-ext");
+	fs.mkdirSync(installed, { recursive: true });
+	fs.cpSync(ext, installed, { recursive: true });
+	writeFile(
+		path.join(pluginsDir, "omp-plugins.lock.json"),
+		JSON.stringify({
+			plugins: { "my-project-ext": { version: "1.0.0", enabled: true, enabledFeatures: null } },
+			settings: {},
+		}),
+	);
+
+	const skills = await loadFromPlugin<{ name: string; path: string; level: "user" | "project" }>(
+		skillCapability.id,
+		ctx(),
+	);
+	const found = skills.find(s => s.name === "my-skill" && s.path.includes("my-project-ext"));
+	expect(found?.level).toBe("project");
 });
 
 test("disabled installed plugins do not contribute sub-discovery", async () => {

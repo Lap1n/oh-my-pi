@@ -1,10 +1,14 @@
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { type AutocompleteItem, Spacer } from "@oh-my-pi/pi-tui";
-import { APP_NAME, setProjectDir } from "@oh-my-pi/pi-utils";
+import { APP_NAME, getProjectDir, setProjectDir } from "@oh-my-pi/pi-utils";
+import { reset as resetCapabilities } from "../capability";
 import { COLLAB_GUEST_ALLOWED_COMMANDS, CollabGuestLink } from "../collab/guest";
 import { CollabHost } from "../collab/host";
+import { expandRoleAlias, getModelMatchPreferences, resolveCliModel } from "../config/model-resolver";
+import { applyProviderGlobalsFromSettings } from "../config/provider-globals";
 import type { SettingPath, SettingValue } from "../config/settings";
 import { settings } from "../config/settings";
 import {
@@ -12,6 +16,7 @@ import {
 	resolveActiveProjectRegistryPath,
 	resolveOrDefaultProjectRegistryPath,
 } from "../discovery/helpers.js";
+import { parseExportArgs } from "../export/html/args";
 import { shareSession } from "../export/share";
 import { PluginManager } from "../extensibility/plugins";
 import {
@@ -22,14 +27,25 @@ import {
 	MarketplaceManager,
 } from "../extensibility/plugins/marketplace";
 import { resolveMemoryBackend } from "../memory-backend";
+import { runPauseScreen } from "../modes/components/pause-screen";
 import { describeLoopLimitRuntime } from "../modes/loop-limit";
 import { theme } from "../modes/theme/theme";
 import type { InteractiveModeContext } from "../modes/types";
+import { extractLastCodeBlock, extractLastCommand } from "../modes/utils/copy-targets";
 import type { AgentSession, FreshSessionResult } from "../session/agent-session";
+import type { SessionOAuthAccountList } from "../session/agent-session-types";
 import { COMPACT_MODES, parseCompactArgs } from "../session/compact-modes";
+import { resolveResumableSession } from "../session/session-listing";
 import { formatShakeSummary, type ShakeMode } from "../session/shake-types";
+import { expandTilde, resolveToCwd } from "../tools/path-utils";
 import { urlHyperlinkAlways } from "../tui";
-import { getChangelogPath, parseChangelog } from "../utils/changelog";
+import {
+	getChangelogPath,
+	parseChangelog,
+	RECENT_CHANGELOG_ENTRY_LIMIT,
+	renderChangelogEntries,
+} from "../utils/changelog";
+import { copyToClipboard } from "../utils/clipboard";
 import { CollabQrCodeComponent } from "./helpers/collab-qrcode";
 import { buildContextReportText } from "./helpers/context-report";
 import { formatDuration } from "./helpers/format";
@@ -37,6 +53,7 @@ import { createMarketplaceManager } from "./helpers/marketplace-manager";
 import { handleMcpAcp } from "./helpers/mcp";
 import { commandConsumed, errorMessage, parseSlashCommand, parseSubcommand, usage } from "./helpers/parse";
 import { describeRedeemOutcome, type ResetUsageAccount, toResetUsageAccounts } from "./helpers/reset-usage";
+import { matchSessionPinAccounts, toSessionPinAccounts } from "./helpers/session-pin";
 import { handleSshAcp } from "./helpers/ssh";
 import { launchStatsDashboard, parseStatsDashboardArgs } from "./helpers/stats-dashboard";
 import { handleTodoAcp } from "./helpers/todo";
@@ -58,28 +75,39 @@ export type { BuiltinSlashCommand, SubcommandDef } from "./types";
 export type BuiltinSlashCommandRuntime = TuiSlashCommandRuntime;
 
 export interface TuiBuiltinSlashCommand extends BuiltinSlashCommand {
-	getArgumentCompletions?: (prefix: string) => AutocompleteItem[] | null;
+	getArgumentCompletions?: (prefix: string) => AutocompleteItem[] | null | Promise<AutocompleteItem[] | null>;
 	getInlineHint?: (argumentText: string) => string | null;
 	getAutocompleteDescription?: () => string | undefined;
 }
 
 function refreshStatusLine(ctx: InteractiveModeContext): void {
 	ctx.statusLine.invalidate();
-	ctx.updateEditorTopBorder();
 	ctx.ui.requestRender();
 }
 
-/** `/fast status` label: "off", "on", or scope-qualified "on (… only)". */
+/** `/fast status` label for the active model: "on" when its family is priority, else "off". */
 function formatFastModeStatus(session: AgentSession): string {
-	if (!session.isFastModeEnabled()) return "off";
-	switch (session.serviceTier) {
-		case "openai-only":
-			return "on (OpenAI only)";
-		case "claude-only":
-			return "on (Claude only)";
-		default:
-			return "on";
+	return session.isFastModeEnabled() ? "on" : "off";
+}
+
+/** `/computer status` label for the session-effective `computer.enabled` value. */
+function formatComputerUseStatus(session: AgentSession): string {
+	return session.settings.get("computer.enabled") ? "on" : "off";
+}
+
+/**
+ * Apply a session-scoped computer-use toggle: flip the active tool slate first
+ * (so a failed enable never leaves a stale settings override), then record the
+ * runtime override — never `settings.set`, which would persist to settings.json.
+ * Returns the operator feedback line.
+ */
+async function applyComputerUseToggle(session: AgentSession, enable: boolean): Promise<string> {
+	const applied = await session.setComputerToolEnabled(enable);
+	if (enable && !applied) {
+		return "Computer use is unavailable in this session.";
 	}
+	session.settings.override("computer.enabled", enable);
+	return `Computer use ${enable ? "enabled" : "disabled"} for this session.`;
 }
 
 const AUTOCOMPLETE_DETAIL_LIMIT = 48;
@@ -190,12 +218,88 @@ async function handleUsageResetCommand(
 	await output(describeRedeemOutcome(outcome, target.label));
 }
 
+async function handleSessionPinCommand(
+	arg: string,
+	session: AgentSession,
+	output: SlashCommandRuntime["output"],
+): Promise<void> {
+	if (session.isStreaming) {
+		await output("Cannot pin an account while the session is streaming.");
+		return;
+	}
+	let accountList: SessionOAuthAccountList | undefined;
+	try {
+		accountList = await session.listCurrentProviderOAuthAccounts();
+	} catch (error) {
+		await output(`Could not load provider accounts: ${errorMessage(error)}`);
+		return;
+	}
+	if (!accountList) {
+		await output("Select a model before pinning a provider account.");
+		return;
+	}
+	const provider = getOAuthProviders().find(candidate => candidate.id === accountList.provider);
+	const providerName = provider?.name ?? accountList.provider;
+	const accounts = toSessionPinAccounts(accountList.accounts);
+	if (accounts.length === 0) {
+		const source = session.modelRegistry.authStorage.describeCredentialSource(
+			accountList.provider,
+			session.sessionId,
+		);
+		await output(
+			source
+				? `No stored OAuth accounts for ${providerName}. Current auth comes from ${source}.`
+				: `No stored OAuth accounts for ${providerName}. Use /login to add one.`,
+		);
+		return;
+	}
+
+	const selector = arg.trim();
+	if (!selector) {
+		const lines = [`OAuth accounts for ${providerName}:`];
+		for (const account of accounts) {
+			lines.push(`${account.position + 1}. ${account.label}${account.active ? " (active)" : ""}`);
+		}
+		lines.push("", "Pin one with `/session pin <number|email|account id>`.");
+		await output(lines.join("\n"));
+		return;
+	}
+
+	const matches = matchSessionPinAccounts(accounts, selector);
+	if (matches.length === 0) {
+		await output(`No ${providerName} account matches "${selector}".`);
+		return;
+	}
+	if (matches.length > 1) {
+		await output(
+			`"${selector}" matches multiple ${providerName} accounts: ${matches
+				.map(account => `${account.position + 1}. ${account.label}`)
+				.join(", ")}. Use the account number.`,
+		);
+		return;
+	}
+	const account = matches[0];
+	if (!account || !session.pinCurrentProviderOAuthAccount(account.credentialId)) {
+		await output(`${account?.label ?? selector} is no longer available to pin.`);
+		return;
+	}
+	await output(`Pinned ${account.label} to this session for ${providerName}.`);
+}
+
 /** Parse the `/shake` subcommand into a {@link ShakeMode}; empty defaults to elide. */
 function parseShakeMode(args: string): ShakeMode | { error: string } {
 	const verb = args.trim().toLowerCase();
 	if (verb === "" || verb === "elide") return "elide";
 	if (verb === "images") return "images";
 	return { error: `Unknown /shake mode "${verb}". Use elide or images.` };
+}
+
+/** Format the session's workspace directories (cwd + additional) for display. */
+function formatWorkspaceDirectories(runtime: SlashCommandRuntime, note?: string): string {
+	const cwd = runtime.sessionManager.getCwd();
+	const additional = runtime.sessionManager.getAdditionalDirectories();
+	const lines = ["Workspace directories:", `  ${cwd} (working directory)`, ...additional.map(d => `  ${d}`)];
+	return note ? `${note}\n${lines.join("\n")}` : lines.join("\n");
 }
 
 const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
@@ -239,11 +343,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			return "Plan: off";
 		},
 		handleTui: async (command, runtime) => {
-			const hadArgs = !!command.args;
 			await runtime.ctx.handlePlanModeCommand(command.args || undefined);
-			if (hadArgs) {
-				runtime.ctx.editor.addToHistory(command.text);
-			}
 			runtime.ctx.editor.setText("");
 		},
 	},
@@ -254,6 +354,22 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			runtime.ctx.planModeEnabled ? "Plan review: available" : "Plan review: plan mode inactive",
 		handleTui: async (_command, runtime) => {
 			await runtime.ctx.openPlanReview();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "vibe",
+		description: "Toggle vibe mode (direct persistent fast/good worker sessions; read-only toolset)",
+		inlineHint: "[prompt]",
+		allowArgs: true,
+		getTuiAutocompleteDescription: runtime => {
+			if (runtime.ctx.vibeModeEnabled) return "Vibe: on";
+			if (runtime.ctx.planModeEnabled) return "Vibe: blocked by plan mode";
+			if (runtime.ctx.goalModeEnabled) return "Vibe: blocked by goal mode";
+			return "Vibe: off";
+		},
+		handleTui: async (command, runtime) => {
+			await runtime.ctx.handleVibeModeCommand(command.args || undefined);
 			runtime.ctx.editor.setText("");
 		},
 	},
@@ -277,11 +393,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			return state ? `Goal: ${state.goal.status} (${shortDetail(state.goal.objective)})` : "Goal: off";
 		},
 		handleTui: async (command, runtime) => {
-			const hadArgs = !!command.args;
 			await runtime.ctx.handleGoalModeCommand(command.args || undefined);
-			if (hadArgs) {
-				runtime.ctx.editor.addToHistory(command.text);
-			}
 			runtime.ctx.editor.setText("");
 		},
 	},
@@ -303,6 +415,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		allowArgs: true,
 		getTuiAutocompleteDescription: runtime => {
 			if (!runtime.ctx.loopModeEnabled) return "Loop: off";
+			if (runtime.ctx.loopModePaused) return "Loop: paused";
 			if (runtime.ctx.loopLimit) return `Loop: on (${describeLoopLimitRuntime(runtime.ctx.loopLimit)})`;
 			if (runtime.ctx.loopPrompt) return "Loop: on (repeating prompt)";
 			return "Loop: on (waiting for next prompt)";
@@ -313,6 +426,15 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			// Surface any inline prompt so the dispatcher returns it and the normal
 			// submit flow runs the first loop iteration (recording it as the loop prompt).
 			if (prompt) return { prompt };
+		},
+	},
+	{
+		name: "queue",
+		description: "Queue a message for after the agent yields",
+		inlineHint: "<message>",
+		allowArgs: true,
+		handleTui: async (command, runtime) => {
+			await runtime.ctx.handleQueueCommand(command.args);
 		},
 	},
 	{
@@ -391,8 +513,8 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				return commandConsumed();
 			}
 			if (arg === "on") {
-				runtime.session.setFastMode(true);
-				await runtime.output("Fast mode enabled.");
+				const supported = runtime.session.setFastMode(true);
+				await runtime.output(supported ? "Fast mode enabled." : "Fast mode is unavailable for the current model.");
 				return commandConsumed();
 			}
 			if (arg === "off") {
@@ -416,9 +538,11 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				return;
 			}
 			if (arg === "on") {
-				runtime.ctx.session.setFastMode(true);
+				const supported = runtime.ctx.session.setFastMode(true);
 				refreshStatusLine(runtime.ctx);
-				runtime.ctx.showStatus("Fast mode enabled.");
+				runtime.ctx.showStatus(
+					supported ? "Fast mode enabled." : "Fast mode is unavailable for the current model.",
+				);
 				runtime.ctx.editor.setText("");
 				return;
 			}
@@ -439,19 +563,88 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "computer",
+		description: "Toggle the native computer-use tool for this session",
+		acpDescription: "Toggle computer use",
+		acpInputHint: "[on|off|status]",
+		subcommands: [
+			{ name: "on", description: "Enable computer use for this session" },
+			{ name: "off", description: "Disable computer use for this session" },
+			{ name: "status", description: "Show computer use status" },
+		],
+		allowArgs: true,
+		getTuiAutocompleteDescription: runtime => `Computer: ${formatComputerUseStatus(runtime.ctx.session)}`,
+		handle: async (command, runtime) => {
+			const arg = command.args.trim().toLowerCase();
+			if (arg === "status") {
+				await runtime.output(`Computer use is ${formatComputerUseStatus(runtime.session)}.`);
+				return commandConsumed();
+			}
+			if (!arg || arg === "toggle" || arg === "on" || arg === "off") {
+				const enable = arg === "off" ? false : arg === "on" || !runtime.session.settings.get("computer.enabled");
+				await runtime.output(await applyComputerUseToggle(runtime.session, enable));
+				return commandConsumed();
+			}
+			return usage("Usage: /computer [on|off|status]", runtime);
+		},
+		handleTui: async (command, runtime) => {
+			const arg = command.args.trim().toLowerCase();
+			if (arg === "status") {
+				runtime.ctx.showStatus(`Computer use is ${formatComputerUseStatus(runtime.ctx.session)}.`);
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			if (!arg || arg === "toggle" || arg === "on" || arg === "off") {
+				const enable =
+					arg === "off" ? false : arg === "on" || !runtime.ctx.session.settings.get("computer.enabled");
+				runtime.ctx.showStatus(await applyComputerUseToggle(runtime.ctx.session, enable));
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			runtime.ctx.showStatus("Usage: /computer [on|off|status]");
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "prewalk",
+		description: "Switch to a fast/cheap model at the next action (works even without --prewalk)",
+		acpDescription: "Prewalk at the next action",
+		handle: async (_command, runtime) => {
+			const rolePattern = expandRoleAlias("@smol", runtime.settings);
+			const resolved = resolveCliModel({
+				cliModel: rolePattern,
+				modelRegistry: runtime.session.modelRegistry,
+				preferences: getModelMatchPreferences(runtime.settings),
+			});
+			if (resolved.error || !resolved.model) {
+				return usage(resolved.error ?? `Model "${rolePattern}" not found`, runtime);
+			}
+			if (!runtime.session.modelRegistry.hasConfiguredAuth(resolved.model)) {
+				return usage(`No API key for ${resolved.model.provider}/${resolved.model.id}`, runtime);
+			}
+			runtime.session.armPrewalk(resolved.model, resolved.thinkingLevel);
+			await runtime.output(
+				`Prewalk on: switching to ${resolved.model.provider}/${resolved.model.id} at the next edit/write (todo-gated).`,
+			);
+			return commandConsumed();
+		},
+	},
+	{
 		name: "advisor",
 		description: "Toggle the advisor (a second model that reviews each turn and injects notes)",
 		acpDescription: "Toggle advisor",
-		acpInputHint: "[on|off|status|dump [raw]]",
+		acpInputHint: "[on|off|status|dump [raw]|configure]",
 		subcommands: [
 			{ name: "on", description: "Enable the advisor" },
 			{ name: "off", description: "Disable the advisor" },
 			{ name: "status", description: "Show advisor status" },
 			{ name: "dump", description: "Copy the advisor's transcript to clipboard", usage: "[raw]" },
+			{ name: "configure", description: "Open the advisor configuration editor (TUI)" },
 		],
 		allowArgs: true,
 		getTuiAutocompleteDescription: runtime => {
 			const stats = runtime.ctx.session.getAdvisorStats();
+			if (stats.active && stats.advisors.length > 1) return `Advisor: on (${stats.advisors.length} advisors)`;
 			if (stats.active && stats.model) return `Advisor: on (${stats.model.provider}/${stats.model.id})`;
 			if (stats.configured) return "Advisor: configured, no model";
 			return "Advisor: off";
@@ -492,7 +685,13 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				await runtime.output(text ?? "Advisor is not active for this session.");
 				return commandConsumed();
 			}
-			return usage("Usage: /advisor [on|off|status|dump [raw]]", runtime);
+			if (verb === "configure") {
+				await runtime.output(
+					"/advisor configure opens an interactive editor and is only available in the interactive TUI.",
+				);
+				return commandConsumed();
+			}
+			return usage("Usage: /advisor [on|off|status|dump [raw]|configure]", runtime);
 		},
 		handleTui: async (command, runtime) => {
 			const { verb, rest } = parseSubcommand(command.args);
@@ -537,26 +736,27 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				runtime.ctx.editor.setText("");
 				return;
 			}
-			runtime.ctx.showStatus("Usage: /advisor [on|off|status|dump [raw]]");
+			if (verb === "configure") {
+				runtime.ctx.showAdvisorConfigure();
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			runtime.ctx.showStatus("Usage: /advisor [on|off|status|dump [raw]|configure]");
 			runtime.ctx.editor.setText("");
 		},
 	},
 	{
 		name: "export",
 		description: "Export session to HTML file",
-		inlineHint: "[path]",
+		inlineHint: "[--themes] [path]",
 		allowArgs: true,
 		handle: async (command, runtime) => {
-			const arg = command.args.trim();
-			// Match the interactive `/export` behavior: clipboard aliases are not a
-			// valid export target. Without this, the literal value (`copy`,
-			// `--copy`, `clipboard`) is passed to `exportToHtml` and becomes the
-			// output filename.
-			if (arg === "--copy" || arg === "clipboard" || arg === "copy") {
-				return usage("Use /dump to copy the session to clipboard.", runtime);
-			}
 			try {
-				const filePath = await runtime.session.exportToHtml(arg || undefined);
+				const { outputPath, useUserThemes } = parseExportArgs(command.args);
+				if (outputPath === "--copy" || outputPath === "clipboard" || outputPath === "copy") {
+					return usage("Use /dump to copy the session to clipboard.", runtime);
+				}
+				const filePath = await runtime.session.exportToHtml(outputPath, useUserThemes);
 				await runtime.output(`Session exported to: ${filePath}`);
 				return commandConsumed();
 			} catch (err) {
@@ -840,8 +1040,39 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "copy",
 		description: "Pick text or code from the conversation to copy",
-		handleTui: (_command, runtime) => {
-			runtime.ctx.showCopySelector();
+		allowArgs: true,
+		handleTui: async (command, runtime) => {
+			const arg = command.args.trim().toLowerCase();
+			if (!arg) {
+				runtime.ctx.showCopySelector();
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			if (arg === "code") {
+				const block = extractLastCodeBlock(runtime.ctx.session.messages);
+				if (!block) {
+					runtime.ctx.showStatus("No code block to copy.");
+					runtime.ctx.editor.setText("");
+					return;
+				}
+				await copyToClipboard(block.code);
+				runtime.ctx.showStatus("Copied code block to clipboard");
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			if (arg === "cmd" || arg === "command") {
+				const lastCommand = extractLastCommand(runtime.ctx.session.messages);
+				if (!lastCommand) {
+					runtime.ctx.showStatus("No command to copy.");
+					runtime.ctx.editor.setText("");
+					return;
+				}
+				await copyToClipboard(lastCommand.code);
+				runtime.ctx.showStatus(`Copied ${lastCommand.kind === "bash" ? "bash command" : "eval code"} to clipboard`);
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			runtime.ctx.showStatus("Usage: /copy [code|cmd]");
 			runtime.ctx.editor.setText("");
 		},
 	},
@@ -883,15 +1114,21 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "session",
 		description: "Session management commands",
-		acpDescription: "Show session information",
-		acpInputHint: "info|delete",
+		acpDescription: "Show or configure the current session",
+		acpInputHint: "[info|delete|pin [account]]",
 		subcommands: [
 			{ name: "info", description: "Show session info and stats" },
 			{ name: "delete", description: "Delete current session and return to selector" },
+			{
+				name: "pin",
+				description: "Pin the current provider to a stored OAuth account",
+				usage: "[account]",
+			},
 		],
 		allowArgs: true,
 		handle: async (command, runtime) => {
-			if (!command.args || command.args === "info") {
+			const { verb, rest } = parseSubcommand(command.args);
+			if (!verb || (verb === "info" && !rest)) {
 				await runtime.output(
 					[
 						`Session: ${runtime.session.sessionId}`,
@@ -901,7 +1138,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				);
 				return commandConsumed();
 			}
-			if (command.args === "delete") {
+			if (verb === "delete" && !rest) {
 				if (runtime.session.isStreaming) return usage("Cannot delete the session while streaming.", runtime);
 				const sessionFile = runtime.sessionManager.getSessionFile();
 				if (!sessionFile) return usage("No session file to delete (in-memory session).", runtime);
@@ -920,17 +1157,34 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				);
 				return commandConsumed();
 			}
-			return usage("Usage: /session [info|delete]", runtime);
+			if (verb === "pin") {
+				await handleSessionPinCommand(rest, runtime.session, runtime.output);
+				return commandConsumed();
+			}
+			return usage("Usage: /session [info|delete|pin [account]]", runtime);
 		},
 		handleTui: async (command, runtime) => {
-			const sub = command.args.trim().toLowerCase() || "info";
-			if (sub === "delete") {
+			const { verb, rest } = parseSubcommand(command.args);
+			if (verb === "delete" && !rest) {
 				runtime.ctx.editor.setText("");
 				await runtime.ctx.handleSessionDeleteCommand();
 				return;
 			}
-			// Default: show session info
-			await runtime.ctx.handleSessionCommand();
+			if (verb === "pin") {
+				if (rest) {
+					await handleSessionPinCommand(rest, runtime.ctx.session, text => runtime.ctx.showStatus(text));
+					refreshStatusLine(runtime.ctx);
+				} else {
+					await runtime.ctx.showSessionPinSelector();
+				}
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			if (!verb || (verb === "info" && !rest)) {
+				await runtime.ctx.handleSessionCommand();
+			} else {
+				runtime.ctx.showStatus("Usage: /session [info|delete|pin [account]]");
+			}
 			runtime.ctx.editor.setText("");
 		},
 	},
@@ -1047,17 +1301,12 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			const changelogPath = getChangelogPath();
 			const allEntries = await parseChangelog(changelogPath);
 			const showFull = command.args.trim().toLowerCase() === "full";
-			const entriesToShow = showFull ? allEntries : allEntries.slice(0, 3);
+			const entriesToShow = showFull ? allEntries : allEntries.slice(0, RECENT_CHANGELOG_ENTRY_LIMIT);
 			if (entriesToShow.length === 0) {
 				await runtime.output("No changelog entries found.");
 				return commandConsumed();
 			}
-			await runtime.output(
-				[...entriesToShow]
-					.reverse()
-					.map(entry => entry.content)
-					.join("\n\n"),
-			);
+			await runtime.output(renderChangelogEntries(entriesToShow).markdown);
 			return commandConsumed();
 		},
 		handleTui: async (command, runtime) => {
@@ -1090,7 +1339,11 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				await runtime.output("No tools are available.");
 				return commandConsumed();
 			}
-			await runtime.output(all.map(name => `${active.includes(name) ? "*" : "-"} ${name}`).join("\n"));
+			const lines = all.map(name => `${active.includes(name) ? "*" : "-"} ${name}`);
+			for (const mounted of runtime.session.getXdevToolEntries()) {
+				lines.push(`~ xd://${mounted.name}`);
+			}
+			await runtime.output(lines.join("\n"));
 			return commandConsumed();
 		},
 		handleTui: (_command, runtime) => {
@@ -1270,7 +1523,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		allowArgs: true,
 		handle: handleMcpAcp,
 		handleTui: async (command, runtime) => {
-			runtime.ctx.editor.addToHistory(command.text);
 			runtime.ctx.editor.setText("");
 			await runtime.ctx.handleMCPCommand(command.text);
 		},
@@ -1293,13 +1545,13 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		allowArgs: true,
 		handle: handleSshAcp,
 		handleTui: async (command, runtime) => {
-			runtime.ctx.editor.addToHistory(command.text);
 			runtime.ctx.editor.setText("");
 			await runtime.ctx.handleSSHCommand(command.text);
 		},
 	},
 	{
 		name: "new",
+		aliases: ["clear"],
 		description: "Start a new session",
 		handleTui: async (_command, runtime) => {
 			runtime.ctx.editor.setText("");
@@ -1424,9 +1676,26 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "resume",
 		description: "Resume a different session",
-		handleTui: (_command, runtime) => {
-			runtime.ctx.showSessionSelector();
+		inlineHint: "[session id]",
+		allowArgs: true,
+		handleTui: async (command, runtime) => {
+			const sessionArg = command.args.trim();
 			runtime.ctx.editor.setText("");
+			if (!sessionArg) {
+				runtime.ctx.showSessionSelector();
+				return;
+			}
+			const match = await resolveResumableSession(
+				sessionArg,
+				runtime.ctx.sessionManager.getCwd(),
+				runtime.ctx.sessionManager.getSessionDir(),
+				{ allowGlobalFallback: true },
+			);
+			if (!match) {
+				runtime.ctx.showError(`Session "${sessionArg}" not found`);
+				return;
+			}
+			await runtime.ctx.handleResumeSession(match.session.path);
 		},
 	},
 	{
@@ -1436,9 +1705,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		allowArgs: true,
 		handleTui: async (command, runtime) => {
 			const question = command.text.slice(`/${command.name}`.length).trim();
-			if (question) {
-				runtime.ctx.editor.addToHistory(command.text);
-			}
 			runtime.ctx.editor.setText("");
 			await runtime.ctx.handleBtwCommand(question);
 		},
@@ -1450,9 +1716,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		allowArgs: true,
 		handleTui: async (command, runtime) => {
 			const work = command.text.slice(`/${command.name}`.length).trim();
-			if (work) {
-				runtime.ctx.editor.addToHistory(command.text);
-			}
 			runtime.ctx.editor.setText("");
 			await runtime.ctx.handleTanCommand(work);
 		},
@@ -1464,9 +1727,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		allowArgs: true,
 		handleTui: async (command, runtime) => {
 			const complaint = command.text.slice(`/${command.name}`.length).trim();
-			if (complaint) {
-				runtime.ctx.editor.addToHistory(command.text);
-			}
 			runtime.ctx.editor.setText("");
 			await runtime.ctx.handleOmfgCommand(complaint);
 		},
@@ -1558,7 +1818,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			}
 		},
 		handleTui: async (command, runtime) => {
-			runtime.ctx.editor.addToHistory(command.text);
 			runtime.ctx.editor.setText("");
 			await runtime.ctx.handleMemoryCommand(command.text);
 		},
@@ -1586,52 +1845,121 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				runtime.ctx.editor.setText("");
 				return;
 			}
-			runtime.ctx.editor.addToHistory(command.text);
 			runtime.ctx.editor.setText("");
 			await runtime.ctx.handleRenameCommand(title);
 		},
 	},
 	{
 		name: "move",
-		description: "Move session to a different working directory",
-		acpDescription: "Move the current session file",
-		inlineHint: "<path>",
+		description: "Move the current session to a different directory",
+		acpDescription: "Move the current session to a different directory",
+		inlineHint: "[<path>]",
 		allowArgs: true,
 		handle: async (command, runtime) => {
 			if (runtime.session.isStreaming) return usage("Cannot move while streaming.", runtime);
 			if (!command.args) return usage("Usage: /move <path>", runtime);
-			const resolvedPath = path.resolve(runtime.cwd, command.args);
-			let isDirectory: boolean;
+			const resolvedPath = resolveToCwd(command.args, runtime.cwd);
 			try {
-				isDirectory = (await fs.stat(resolvedPath)).isDirectory();
+				const stat = await fs.stat(resolvedPath);
+				if (!stat.isDirectory()) {
+					return usage(`Not a directory: ${resolvedPath}`, runtime);
+				}
 			} catch {
-				return usage(`Directory does not exist or is not a directory: ${resolvedPath}`, runtime);
+				return usage(`Directory does not exist: ${resolvedPath}`, runtime);
 			}
-			if (!isDirectory) return usage(`Directory does not exist or is not a directory: ${resolvedPath}`, runtime);
 			try {
-				await runtime.sessionManager.flush();
-				await runtime.sessionManager.moveTo(resolvedPath);
+				await runtime.settings.flush();
+			} catch (err) {
+				return usage(`Failed to save pending settings: ${errorMessage(err)}`, runtime);
+			}
+			try {
+				await runtime.session.moveSession(resolvedPath);
 			} catch (err) {
 				return usage(`Move failed: ${errorMessage(err)}`, runtime);
 			}
 			setProjectDir(resolvedPath);
+			await runtime.settings.reloadForCwd(resolvedPath);
+			applyProviderGlobalsFromSettings(runtime.settings);
 			// Reload plugin/capability caches so the next prompt sees commands and
 			// capabilities scoped to the new cwd.
 			await runtime.reloadPlugins();
+			await runtime.notifyConfigChanged?.();
 			await runtime.notifyTitleChanged?.();
-			await runtime.output(`Session moved to ${runtime.sessionManager.getCwd()}.`);
+			await runtime.output(`Moved to ${runtime.sessionManager.getCwd()}.`);
 			return commandConsumed();
 		},
 		handleTui: async (command, runtime) => {
-			const targetPath = command.args;
-			if (!targetPath) {
-				runtime.ctx.showError("Usage: /move <path>");
-				runtime.ctx.editor.setText("");
-				return;
-			}
 			runtime.ctx.editor.addToHistory(command.text);
 			runtime.ctx.editor.setText("");
-			await runtime.ctx.handleMoveCommand(targetPath);
+			await runtime.ctx.handleMoveCommand(command.args || undefined);
+		},
+	},
+	{
+		name: "add-dir",
+		description: "Add a workspace directory to this session (multi-root)",
+		acpDescription: "Add a workspace directory to this session",
+		inlineHint: "<path>",
+		allowArgs: true,
+		handle: async (command, runtime) => {
+			if (runtime.session.isStreaming) return usage("Cannot add a directory while streaming.", runtime);
+			if (!command.args) return usage(formatWorkspaceDirectories(runtime, "Usage: /add-dir <path>"), runtime);
+			const resolved = resolveToCwd(command.args, runtime.cwd);
+			try {
+				const stat = await fs.stat(resolved);
+				if (!stat.isDirectory()) return usage(`Not a directory: ${resolved}`, runtime);
+			} catch {
+				return usage(`Directory does not exist: ${resolved}`, runtime);
+			}
+			let added: string | null;
+			try {
+				added = await runtime.sessionManager.addWorkspaceDirectory(resolved);
+			} catch (err) {
+				return usage(errorMessage(err), runtime);
+			}
+			if (added === null) {
+				await runtime.output(`Already in the workspace: ${resolved}`);
+				return commandConsumed();
+			}
+			await runtime.session.refreshBaseSystemPrompt();
+			await runtime.output(formatWorkspaceDirectories(runtime, `Added ${added}.`));
+			return commandConsumed();
+		},
+	},
+	{
+		name: "remove-dir",
+		description: "Remove a workspace directory from this session",
+		acpDescription: "Remove a workspace directory from this session",
+		inlineHint: "<path>",
+		allowArgs: true,
+		handle: async (command, runtime) => {
+			if (runtime.session.isStreaming) return usage("Cannot remove a directory while streaming.", runtime);
+			if (!command.args) return usage("Usage: /remove-dir <path>", runtime);
+			const resolved = resolveToCwd(command.args, runtime.cwd);
+			if (resolved === path.resolve(runtime.cwd)) {
+				return usage("Cannot remove the working directory; use /move to change it.", runtime);
+			}
+			let removed: string | null;
+			try {
+				removed = await runtime.sessionManager.removeWorkspaceDirectory(resolved);
+			} catch (err) {
+				return usage(errorMessage(err), runtime);
+			}
+			if (removed === null) {
+				await runtime.output(`Not a workspace directory: ${resolved}`);
+				return commandConsumed();
+			}
+			await runtime.session.refreshBaseSystemPrompt();
+			await runtime.output(formatWorkspaceDirectories(runtime, `Removed ${removed}.`));
+			return commandConsumed();
+		},
+	},
+	{
+		name: "dirs",
+		description: "List this session's workspace directories",
+		acpDescription: "List this session's workspace directories",
+		handle: async (_command, runtime) => {
+			await runtime.output(formatWorkspaceDirectories(runtime));
+			return commandConsumed();
 		},
 	},
 	{
@@ -2162,8 +2490,9 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			// listClaudePluginRoots re-reads from disk on next access.
 			const projectPath = await resolveActiveProjectRegistryPath(runtime.ctx.sessionManager.getCwd());
 			clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
+			await runtime.ctx.refreshSkillState();
 			await runtime.ctx.refreshSlashCommandState();
-			await runtime.ctx.session.refreshSshTool({ activateIfAvailable: true });
+			resetCapabilities();
 			runtime.ctx.showStatus("Plugins reloaded.");
 			runtime.ctx.editor.setText("");
 		},
@@ -2218,7 +2547,24 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "live",
+		description: "Start Codex-backed realtime voice mode",
+		handleTui: async (_command, runtime) => {
+			runtime.ctx.editor.setText("");
+			await runtime.ctx.handleLiveCommand();
+		},
+	},
+	{
+		name: "pause",
+		description: "Freeze all agents (main, subagents, advisor) until resumed",
+		handleTui: async (_command, runtime) => {
+			runtime.ctx.editor.setText("");
+			await runPauseScreen(runtime.ctx);
+		},
+	},
+	{
 		name: "quit",
+		aliases: ["q"],
 		description: "Quit the application",
 		handleTui: shutdownHandlerTui,
 	},
@@ -2298,11 +2644,112 @@ function buildStaticInlineHint(hint: string): (argumentText: string) => string |
 	return (argumentText: string) => (argumentText.trim().length === 0 ? hint : null);
 }
 
+/**
+ * Build getArgumentCompletions that suggests directories relative to the
+ * current project directory. Used by /move so users can Tab-complete the
+ * destination directory.
+ */
+function buildDirectoryArgumentCompletions(): (prefix: string) => Promise<AutocompleteItem[] | null> {
+	return async (argumentPrefix: string) => {
+		const prefix = argumentPrefix.trim();
+
+		const cwd = getProjectDir();
+		const expandedPrefix = expandTilde(prefix);
+		const isAbsolute = path.isAbsolute(expandedPrefix);
+
+		let searchDir: string;
+		let searchPrefix: string;
+		if (
+			prefix === "" ||
+			prefix === "." ||
+			prefix === "./" ||
+			prefix === ".." ||
+			prefix === "../" ||
+			prefix === "~" ||
+			prefix === "~/" ||
+			prefix === "/"
+		) {
+			searchDir = isAbsolute ? expandedPrefix : path.join(cwd, expandedPrefix);
+			searchPrefix = "";
+		} else if (expandedPrefix.endsWith("/")) {
+			searchDir = isAbsolute ? expandedPrefix : path.join(cwd, expandedPrefix);
+			searchPrefix = "";
+		} else {
+			const dir = path.dirname(expandedPrefix);
+			searchDir = isAbsolute ? dir : path.join(cwd, dir);
+			searchPrefix = path.basename(expandedPrefix);
+		}
+
+		try {
+			const entries = await fs.readdir(searchDir, { withFileTypes: true });
+			const suggestions: AutocompleteItem[] = [];
+			for (const entry of entries) {
+				if (!entry.name.toLowerCase().startsWith(searchPrefix.toLowerCase())) continue;
+				if (entry.name === ".git") continue;
+
+				let isDirectory = entry.isDirectory();
+				if (!isDirectory && entry.isSymbolicLink()) {
+					try {
+						isDirectory = (await fs.stat(path.join(searchDir, entry.name))).isDirectory();
+					} catch {
+						continue;
+					}
+				}
+				if (!isDirectory) continue;
+
+				const absoluteValue = path.join(searchDir, entry.name);
+				const displayValue = buildDirectoryCompletionDisplayValue(prefix, absoluteValue, cwd);
+				suggestions.push({ value: displayValue, label: `${entry.name}/` });
+			}
+			suggestions.sort((a, b) => a.label.localeCompare(b.label));
+			return suggestions.length > 0 ? suggestions : null;
+		} catch {
+			return null;
+		}
+	};
+}
+function buildDirectoryCompletionDisplayValue(prefix: string, absoluteValue: string, cwd: string): string {
+	// Preserve the user's prefix style where possible, but always return a
+	// value that /move can resolve (absolute or relative) without escaping.
+	const normalized = path.normalize(absoluteValue);
+
+	if (prefix.startsWith("~/")) {
+		const home = os.homedir();
+		const homeRelative = path.relative(home, normalized);
+		return `~/${homeRelative.replaceAll("\\", "/")}/`;
+	}
+	if (prefix === "~") {
+		const home = os.homedir();
+		const homeRelative = path.relative(home, normalized);
+		return `~/${homeRelative.replaceAll("\\", "/")}/`;
+	}
+	if (prefix.startsWith("/")) {
+		return `${normalized.replaceAll("\\", "/")}/`;
+	}
+	if (prefix.startsWith("./")) {
+		const relative = path.relative(cwd, normalized);
+		return `./${relative.replaceAll("\\", "/")}/`;
+	}
+	if (prefix.startsWith("../")) {
+		const relative = path.relative(cwd, normalized);
+		return `${relative.replaceAll("\\", "/")}/`;
+	}
+	if (prefix === "..") {
+		const relative = path.relative(cwd, normalized);
+		return `${relative.replaceAll("\\", "/")}/`;
+	}
+
+	// Default: relative to cwd.
+	const relative = path.relative(cwd, normalized);
+	return `${relative.replaceAll("\\", "/")}/`;
+}
+
 /** Builtin command metadata used for slash-command autocomplete and help text. */
 export const BUILTIN_SLASH_COMMAND_DEFS: ReadonlyArray<BuiltinSlashCommand> = BUILTIN_SLASH_COMMAND_REGISTRY.map(
 	command => ({
 		name: command.name,
 		aliases: command.aliases,
+		allowArgs: command.allowArgs === true,
 		description: command.description,
 		subcommands: command.subcommands,
 		inlineHint: command.inlineHint,
@@ -2318,6 +2765,9 @@ function materializeTuiBuiltinSlashCommand(
 	if (cmd.subcommands) {
 		materialized.getArgumentCompletions = buildArgumentCompletions(cmd.subcommands);
 		materialized.getInlineHint = buildSubcommandInlineHint(cmd.subcommands);
+	} else if (cmd.name === "move") {
+		materialized.getArgumentCompletions = buildDirectoryArgumentCompletions();
+		if (cmd.inlineHint) materialized.getInlineHint = buildStaticInlineHint(cmd.inlineHint);
 	} else if (cmd.inlineHint) {
 		materialized.getInlineHint = buildStaticInlineHint(cmd.inlineHint);
 	}
@@ -2397,8 +2847,9 @@ export async function executeBuiltinSlashCommand(
 			reloadPlugins: async () => {
 				const projectPath = await resolveActiveProjectRegistryPath(ctx.sessionManager.getCwd());
 				clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
+				await ctx.refreshSkillState();
 				await ctx.refreshSlashCommandState();
-				await ctx.session.refreshSshTool({ activateIfAvailable: true });
+				resetCapabilities();
 			},
 		};
 		const result = await command.handle(parsed, adapted);

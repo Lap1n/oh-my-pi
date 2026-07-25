@@ -23,7 +23,9 @@ import {
 	HL_INSERT_HEAD,
 	HL_INSERT_KEYWORD,
 	HL_INSERT_TAIL,
+	HL_MOVE_KEYWORD,
 	HL_PAYLOAD_REPLACE,
+	HL_REM_KEYWORD,
 	HL_REPLACE_BLOCK_KEYWORD,
 	HL_REPLACE_KEYWORD,
 } from "./format";
@@ -38,6 +40,7 @@ const CHAR_HASH = 35;
 const CHAR_TAB = 9;
 const CHAR_SPACE = 32;
 const CHAR_DOT = 46;
+const CHAR_COMMA = 44;
 const CHAR_HYPHEN = 45;
 const CHAR_ELLIPSIS = 0x2026;
 const CHAR_EQUALS = 61;
@@ -163,7 +166,7 @@ function scanRangeSeparator(line: string, index: number, end: number): number | 
 			consumedSeparator = true;
 			continue;
 		}
-		if (code === CHAR_HYPHEN || code === CHAR_ELLIPSIS) {
+		if (code === CHAR_COMMA || code === CHAR_HYPHEN || code === CHAR_ELLIPSIS) {
 			cursor++;
 			consumedSeparator = true;
 			continue;
@@ -212,6 +215,8 @@ export type BlockTarget =
 	| { kind: "insert_before"; anchor: Anchor }
 	| { kind: "insert_after"; anchor: Anchor }
 	| { kind: "insert_after_block"; anchor: Anchor }
+	| { kind: "rem" }
+	| { kind: "move"; dest: string }
 	| { kind: "bof" }
 	| { kind: "eof" };
 
@@ -230,9 +235,34 @@ function scanKeyword(line: string, index: number, end: number, keyword: string):
 	return next;
 }
 
+/**
+ * GLM 5.2 inserts a stray `.` between the line number/range and the trailing
+ * `:` (e.g. `SWAP 2.=3.:`, `INS.POST 2.:`). A `.` is never valid syntax at
+ * this position, so skip it when it precedes an optional `:` or end-of-line.
+ */
+function skipStrayDot(line: string, index: number, end: number): number {
+	if (index < end && line.charCodeAt(index) === CHAR_DOT) {
+		const after = skipWhitespace(line, index + 1, end);
+		if (after === end || line.charCodeAt(after) === CHAR_COLON) return after;
+	}
+	return index;
+}
+
 function consumeOptionalColon(line: string, index: number, end: number): number {
-	const cursor = skipWhitespace(line, index, end);
+	let cursor = skipWhitespace(line, index, end);
+	cursor = skipStrayDot(line, cursor, end);
 	return cursor < end && line.charCodeAt(cursor) === CHAR_COLON ? skipWhitespace(line, cursor + 1, end) : cursor;
+}
+/**
+ * Recover local-model replace trailers that permute `:` and `=` as `:=:` or
+ * `=:`. The range has already been parsed, so these suffixes are unambiguous.
+ */
+function consumeReplaceColon(line: string, index: number, end: number): number {
+	const canonical = consumeOptionalColon(line, index, end);
+	if (canonical >= end || line.charCodeAt(canonical) !== CHAR_EQUALS) return canonical;
+	const afterEquals = skipWhitespace(line, canonical + 1, end);
+	if (afterEquals >= end || line.charCodeAt(afterEquals) !== CHAR_COLON) return canonical;
+	return skipWhitespace(line, afterEquals + 1, end);
 }
 
 function scanInsertTarget(line: string, index: number, end: number): TargetScan | null {
@@ -259,8 +289,53 @@ function scanInsertTarget(line: string, index: number, end: number): TargetScan 
 	return null;
 }
 
+function unquotePath(pathText: string): string {
+	if (pathText.length < 2) return pathText;
+	const first = pathText[0];
+	const last = pathText[pathText.length - 1];
+	if ((first === '"' || first === "'") && first === last) return pathText.slice(1, -1);
+	return pathText;
+}
+
+function scanMoveDest(line: string, index: number, end: number): string | null {
+	const cursor = skipWhitespace(line, index, end);
+	if (cursor >= end) return null;
+	const first = line.charCodeAt(cursor);
+	if (first === 34 /* " */ || first === 39 /* ' */) {
+		const quote = line[cursor];
+		let next = cursor + 1;
+		while (next < end) {
+			const ch = line[next];
+			if (ch === "\\" && next + 1 < end) {
+				next += 2;
+				continue;
+			}
+			if (ch === quote) {
+				const after = skipWhitespace(line, next + 1, end);
+				return after === end ? unquotePath(line.slice(cursor, next + 1)) : null;
+			}
+			next++;
+		}
+		return null;
+	}
+	return unquotePath(line.slice(cursor, end).trim());
+}
+
 function scanHunkAnchor(line: string, start: number, end: number): TargetScan | null {
 	const cursor = skipWhitespace(line, start, end);
+
+	const remEnd = scanKeyword(line, cursor, end, HL_REM_KEYWORD);
+	if (remEnd !== null) {
+		const next = skipWhitespace(line, remEnd, end);
+		if (next !== end) return null;
+		return { target: { kind: "rem" }, nextIndex: next };
+	}
+	const moveEnd = scanKeyword(line, cursor, end, HL_MOVE_KEYWORD);
+	if (moveEnd !== null) {
+		const dest = scanMoveDest(line, moveEnd, end);
+		if (dest === null || dest.length === 0) return null;
+		return { target: { kind: "move", dest }, nextIndex: end };
+	}
 
 	// `replace_block N:` — resolve N to a tree-sitter block range at apply time.
 	const replaceBlockEnd = scanKeyword(line, cursor, end, HL_REPLACE_BLOCK_KEYWORD);
@@ -278,7 +353,7 @@ function scanHunkAnchor(line: string, start: number, end: number): TargetScan | 
 		if (range === null) return null;
 		return {
 			target: { kind: "replace", range: range.range },
-			nextIndex: consumeOptionalColon(line, range.nextIndex, end),
+			nextIndex: consumeReplaceColon(line, range.nextIndex, end),
 		};
 	}
 	// `delete_block N` — resolve N to a tree-sitter block range at apply time
@@ -288,15 +363,18 @@ function scanHunkAnchor(line: string, start: number, end: number): TargetScan | 
 	if (deleteBlockEnd !== null) {
 		const anchor = scanLineNumber(line, skipWhitespace(line, deleteBlockEnd, end), end);
 		if (anchor === null) return null;
-		const next = skipWhitespace(line, anchor.nextIndex, end);
+		let next = skipWhitespace(line, anchor.nextIndex, end);
+		next = skipStrayDot(line, next, end);
 		if (next < end && line.charCodeAt(next) === CHAR_COLON) return null;
 		return { target: { kind: "delete_block", anchor: { line: anchor.line } }, nextIndex: next };
 	}
+	// `delete N.=M` — like `delete_block N`, takes no body and no trailing
+	// colon; a colon here falls through to contamination detection.
 	const deleteEnd = scanKeyword(line, cursor, end, HL_DELETE_KEYWORD);
 	if (deleteEnd !== null) {
 		const range = scanHeaderRange(line, deleteEnd, end, true);
 		if (range === null) return null;
-		const next = skipWhitespace(line, range.nextIndex, end);
+		const next = skipStrayDot(line, range.nextIndex, end);
 		if (next < end && line.charCodeAt(next) === CHAR_COLON) return null;
 		return { target: { kind: "delete", range: range.range }, nextIndex: next };
 	}
@@ -406,7 +484,9 @@ function classifyLine(line: string, lineNum: number): Token {
 	const isHunkLead =
 		line.startsWith(HL_REPLACE_KEYWORD, lead) ||
 		line.startsWith(HL_DELETE_KEYWORD, lead) ||
-		line.startsWith(HL_INSERT_KEYWORD, lead);
+		line.startsWith(HL_INSERT_KEYWORD, lead) ||
+		line.startsWith(HL_REM_KEYWORD, lead) ||
+		line.startsWith(HL_MOVE_KEYWORD, lead);
 	if (isHunkLead) {
 		const hunk = tryParseHunkHeader(line);
 		if (hunk !== null) return { kind: "op-block", lineNum, target: hunk.target };

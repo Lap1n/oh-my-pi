@@ -31,11 +31,13 @@ import {
 	abortReasonText,
 	agentLoop,
 	agentLoopContinue,
+	createSyntheticToolResultMessage,
 	normalizeMessagesForProvider,
 	normalizeTools,
 	resolveOwnedDialectFromEnv,
 } from "./agent-loop";
 import type { AppendOnlyContextManager } from "./append-only-context";
+import { isProviderRefusalMessage } from "./replay-policy";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -44,6 +46,7 @@ import type {
 	AgentState,
 	AgentTool,
 	AgentToolContext,
+	AgentTurnEndContext,
 	AsideMessage,
 	StreamFn,
 	ToolCallContext,
@@ -53,16 +56,13 @@ import { isSoftToolRequirement } from "./types";
 import { EventLoopKeepalive } from "./utils/yield";
 
 /**
- * Default convertToLlm: Keep only LLM-compatible messages, convert attachments.
+ * Default convertToLlm: Keep only LLM-compatible replay messages.
  */
 function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
-	return messages.filter((m): m is Message => m.role === "user" || m.role === "assistant" || m.role === "toolResult");
-}
-
-const ANTHROPIC_OUTPUT_BLOCKED_PREFIX = "Output blocked by conten";
-
-function isAnthropicOutputBlockedError(message: string): boolean {
-	return message.includes(ANTHROPIC_OUTPUT_BLOCKED_PREFIX);
+	return messages.filter((m): m is Message => {
+		if (m.role === "assistant") return !isProviderRefusalMessage(m);
+		return m.role === "user" || m.role === "toolResult";
+	});
 }
 
 function refreshToolChoiceForActiveTools(
@@ -71,6 +71,9 @@ function refreshToolChoiceForActiveTools(
 ): ToolChoice | undefined {
 	if (!toolChoice || typeof toolChoice === "string") {
 		return toolChoice;
+	}
+	if (toolChoice.type === "computer") {
+		return tools.some(tool => tool.native?.type === "computer") ? toolChoice : undefined;
 	}
 
 	const toolName =
@@ -238,6 +241,13 @@ export interface AgentOptions {
 	 */
 	transformToolCallArguments?: (args: Record<string, unknown>, toolName: string) => Record<string, unknown>;
 
+	/**
+	 * Resolve a tool call whose name matched no advertised tool. Lets hosts
+	 * route calls to tools exposed through side transports (e.g. `xd://`
+	 * device mounts) instead of failing with "Tool not found".
+	 */
+	resolveFallbackTool?: (name: string) => AgentTool<any> | undefined;
+
 	/** Enable intent tracing schema injection/stripping in the harness. */
 	intentTracing?: boolean;
 	/**
@@ -262,12 +272,25 @@ export interface AgentOptions {
 	 * Cursor exec handlers for local tool execution.
 	 */
 	cursorExecHandlers?: CursorExecHandlers;
+	/** Additional tools Cursor executes through its MCP request-context bridge, resolved before each provider call. */
+	getCursorTools?: () => AgentTool[];
 
 	/**
 	 * Cursor tool result callback for exec tool responses.
 	 */
 	cursorOnToolResult?: CursorToolResultHandler;
 
+	/** Current working directory used by local tool execution. */
+	cwd?: string;
+	/**
+	 * Resolver for the live working directory, re-read on every turn. When set, it
+	 * overrides the static {@link cwd} at config-build time so a session move
+	 * (`/move`, which updates the host's cwd without reconstructing the Agent) is
+	 * reflected in provider options — e.g. GitLab Duo Agent namespace/project
+	 * discovery keys off this cwd's git remote. Falls back to `cwd` when it returns
+	 * `undefined`.
+	 */
+	cwdResolver?: () => string | undefined;
 	/**
 	 * Called after a tool call has been validated and is about to execute.
 	 * See {@link AgentLoopConfig.beforeToolCall} for full semantics.
@@ -304,10 +327,9 @@ export interface AgentPromptOptions {
 	toolChoice?: ToolChoice;
 }
 
-/** Buffered Cursor tool result with text position at time of call */
+/** Buffered Cursor exec-channel tool result waiting to be emitted after the assistant message. */
 interface CursorToolResultEntry {
 	toolResult: ToolResultMessage;
-	textLengthAtCall: number;
 }
 
 export class Agent {
@@ -353,12 +375,17 @@ export class Agent {
 	#maxRetryDelayMs?: number;
 	#getToolContext?: (toolCall?: ToolCallContext) => AgentToolContext | undefined;
 	#cursorExecHandlers?: CursorExecHandlers;
+	#getCursorTools?: () => AgentTool[];
 	#cursorOnToolResult?: CursorToolResultHandler;
+	#cwd?: string;
+	#cwdResolver?: () => string | undefined;
+
 	#runningPrompt?: Promise<void>;
 	#resolveRunningPrompt?: () => void;
 	#kimiApiFormat?: "openai" | "anthropic";
 	#preferWebsockets?: boolean;
 	#transformToolCallArguments?: (args: Record<string, unknown>, toolName: string) => Record<string, unknown>;
+	#resolveFallbackTool?: (name: string) => AgentTool<any> | undefined;
 	#intentTracing: boolean;
 	#pruneToolDescriptions: boolean;
 	#dialect?: Dialect;
@@ -370,7 +397,7 @@ export class Agent {
 	#onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
 	#onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 	#onBeforeYield?: () => Promise<void> | void;
-	#onTurnEnd?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<void> | void;
+	#onTurnEnd?: (messages: AgentMessage[], signal?: AbortSignal, context?: AgentTurnEndContext) => Promise<void> | void;
 	#asideMessageProvider?: () => AsideMessage[] | Promise<AsideMessage[]>;
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
@@ -395,6 +422,10 @@ export class Agent {
 	 * UI emission, and tool dispatch. Reassign at any time to swap the implementation.
 	 */
 	transformAssistantMessage?: AgentLoopConfig["transformAssistantMessage"];
+	/**
+	 * Hook that peeks whether interrupting IRC asides are queued for the next boundary.
+	 */
+	hasIrcInterrupts?: AgentLoopConfig["hasIrcInterrupts"];
 
 	constructor(opts: AgentOptions = {}) {
 		this.#state = { ...this.#state, ...opts.initialState };
@@ -428,10 +459,14 @@ export class Agent {
 		this.#onSseEvent = opts.onSseEvent;
 		this.#getToolContext = opts.getToolContext;
 		this.#cursorExecHandlers = opts.cursorExecHandlers;
+		this.#getCursorTools = opts.getCursorTools;
 		this.#cursorOnToolResult = opts.cursorOnToolResult;
+		this.#cwd = opts.cwd;
+		this.#cwdResolver = opts.cwdResolver;
 		this.#kimiApiFormat = opts.kimiApiFormat;
 		this.#preferWebsockets = opts.preferWebsockets;
 		this.#transformToolCallArguments = opts.transformToolCallArguments;
+		this.#resolveFallbackTool = opts.resolveFallbackTool;
 		this.#intentTracing = opts.intentTracing === true;
 		this.#pruneToolDescriptions = opts.pruneToolDescriptions === true;
 		this.#dialect = opts.dialect;
@@ -670,6 +705,22 @@ export class Agent {
 		this.#appendOnlyContext = manager;
 	}
 
+	#toolsForModel(model: Model): AgentTool[] {
+		if (model.api !== "cursor-agent" || !this.#getCursorTools) return this.#state.tools;
+		const cursorTools = this.#getCursorTools();
+		if (cursorTools.length === 0) return this.#state.tools;
+
+		const names = new Set(this.#state.tools.map(tool => tool.name));
+		let merged: AgentTool[] | undefined;
+		for (const tool of cursorTools) {
+			if (names.has(tool.name)) continue;
+			merged ??= this.#state.tools.slice();
+			merged.push(tool);
+			names.add(tool.name);
+		}
+		return merged ?? this.#state.tools;
+	}
+
 	/**
 	 * Assemble the provider Context for a side-channel (no-loop) request, mirroring
 	 * the main loop's prefix (system + normalized tools) so it shares the prompt
@@ -694,7 +745,7 @@ export class Agent {
 		const tools = ownedDialect
 			? []
 			: (normalizeTools(
-					this.#state.tools,
+					this.#toolsForModel(model),
 					this.#intentTracing,
 					preferredDialect(model.id),
 					this.#pruneToolDescriptions,
@@ -726,7 +777,11 @@ export class Agent {
 	setOnBeforeYield(fn: (() => Promise<void> | void) | undefined): void {
 		this.#onBeforeYield = fn;
 	}
-	setOnTurnEnd(fn: ((messages: AgentMessage[], signal?: AbortSignal) => Promise<void> | void) | undefined): void {
+	setOnTurnEnd(
+		fn:
+			| ((messages: AgentMessage[], signal?: AbortSignal, context?: AgentTurnEndContext) => Promise<void> | void)
+			| undefined,
+	): void {
 		this.#onTurnEnd = fn;
 	}
 
@@ -1004,6 +1059,22 @@ export class Agent {
 
 		const messages = this.#state.messages;
 		if (messages.length === 0) {
+			// An empty transcript has nothing to resume, but a queued steer/follow-up
+			// must still be delivered as the opening turn — mirroring the assistant-tail
+			// branch below. Throwing here leaves the message undeliverable, and idle-drain
+			// callers (AgentSession#scheduleQueuedMessageDrain) re-arm continue() on every
+			// microtask because hasQueuedMessages() never clears, spinning an unbounded
+			// allocation loop until OOM (issue #6344).
+			const queuedSteering = this.#dequeueSteeringMessages();
+			if (queuedSteering.length > 0) {
+				await this.#runLoop(queuedSteering, { skipInitialSteeringPoll: true });
+				return;
+			}
+			const queuedFollowUp = this.#dequeueFollowUpMessages();
+			if (queuedFollowUp.length > 0) {
+				await this.#runLoop(queuedFollowUp);
+				return;
+			}
 			throw new Error("No messages to continue from");
 		}
 		if (messages[messages.length - 1].role === "assistant") {
@@ -1068,12 +1139,11 @@ export class Agent {
 								}
 							} catch {}
 						}
-						// Buffer tool result with current text length for correct ordering later.
-						// Cursor executes tools server-side during streaming, so the assistant message
-						// already incorporates results. We buffer here and emit in correct order
-						// when the assistant message ends.
-						const textLength = this.#getAssistantTextLength(this.#state.streamMessage);
-						this.#cursorToolResultBuffer.push({ toolResult: finalMessage, textLengthAtCall: textLength });
+						// Cursor executes tools server-side during streaming. We buffer
+						// each toolResult and emit them right after the assistant message
+						// closes (see `#emitCursorSplitAssistantMessage`), so replay
+						// receives (assistant with interleaved toolCall blocks) → results.
+						this.#cursorToolResultBuffer.push({ toolResult: finalMessage });
 						return finalMessage;
 					}
 				: undefined;
@@ -1125,11 +1195,14 @@ export class Agent {
 					await Bun.sleep(0);
 				}
 				context.systemPrompt = this.#state.systemPrompt;
-				context.tools = this.#state.tools;
+				context.tools = this.#toolsForModel(this.#state.model ?? model);
 			},
 			cursorExecHandlers: this.#cursorExecHandlers,
 			cursorOnToolResult,
+			cwd: this.#cwd,
+			getCwd: this.#cwdResolver,
 			transformToolCallArguments: this.#transformToolCallArguments,
+			resolveFallbackTool: this.#resolveFallbackTool,
 			intentTracing: this.#intentTracing,
 			pruneToolDescriptions: this.#pruneToolDescriptions,
 			dialect: this.#dialect,
@@ -1142,8 +1215,9 @@ export class Agent {
 				: undefined,
 			onAssistantMessageEvent: this.#onAssistantMessageEvent,
 			onHarmonyLeak: this.#onHarmonyLeak,
-			onTurnEnd: (messages, signal) => this.#onTurnEnd?.(messages, signal),
+			onTurnEnd: (messages, signal, context) => this.#onTurnEnd?.(messages, signal, context),
 			getToolChoice,
+			getModel: () => this.#state.model ?? model,
 			getReasoning: () => this.#state.thinkingLevel,
 			getDisableReasoning: () => this.#state.disableReasoning,
 			getServiceTier: this.#serviceTierResolver,
@@ -1154,7 +1228,20 @@ export class Agent {
 				}
 				return this.#dequeueSteeringMessages();
 			},
-			hasSteeringMessages: () => this.#steeringQueue.length > 0,
+			hasSteeringMessages: () => {
+				if (this.#steeringQueue.length === 0) {
+					return { queued: false };
+				}
+				for (const message of this.#steeringQueue) {
+					const role = "role" in message ? message.role : undefined;
+					const attribution = "attribution" in message ? message.attribution : undefined;
+					if (role === "user" && attribution !== "agent") {
+						return { queued: true, source: "user" };
+					}
+				}
+				return { queued: true, source: "system" };
+			},
+			hasIrcInterrupts: this.hasIrcInterrupts,
 			getFollowUpMessages: async () => this.#dequeueFollowUpMessages(),
 			getAsideMessages: async () => (await this.#asideMessageProvider?.()) ?? [],
 			onBeforeYield: () => this.#onBeforeYield?.(),
@@ -1162,6 +1249,7 @@ export class Agent {
 		};
 
 		let partial: AgentMessage | null = null;
+		const completedToolCallIds = new Set<string>();
 
 		try {
 			const stream = messages
@@ -1179,6 +1267,9 @@ export class Agent {
 					case "message_update":
 						partial = event.message;
 						this.#state.streamMessage = event.message;
+						if (event.assistantMessageEvent.type === "toolcall_end") {
+							completedToolCallIds.add(event.assistantMessageEvent.toolCall.id);
+						}
 						break;
 
 					case "message_end":
@@ -1240,12 +1331,22 @@ export class Agent {
 				: err instanceof Error
 					? err.message
 					: String(err);
-			const shouldEmitVisibleOutputBlockedError = !stoppedForAbort && isAnthropicOutputBlockedError(errorMessage);
+			const shouldEmitVisibleError = !stoppedForAbort;
 			const assistantPartial = partial?.role === "assistant" ? partial : undefined;
 			const hadAssistantStart = assistantPartial !== undefined;
+			const bufferedCursorResults = this.#cursorToolResultBuffer.map(({ toolResult }) => toolResult);
+			const retainedToolCallIds = new Set(completedToolCallIds);
+			for (const { toolCallId } of bufferedCursorResults) retainedToolCallIds.add(toolCallId);
 			const errorMsg: AssistantMessage =
-				shouldEmitVisibleOutputBlockedError && assistantPartial
-					? { ...assistantPartial, stopReason: "error", errorMessage }
+				shouldEmitVisibleError && assistantPartial
+					? {
+							...assistantPartial,
+							content: assistantPartial.content.filter(
+								block => block.type !== "toolCall" || retainedToolCallIds.has(block.id),
+							),
+							stopReason: "error",
+							errorMessage,
+						}
 					: {
 							role: "assistant",
 							content: [{ type: "text", text: "" }],
@@ -1265,7 +1366,7 @@ export class Agent {
 							timestamp: Date.now(),
 						};
 
-			if (shouldEmitVisibleOutputBlockedError) {
+			if (shouldEmitVisibleError) {
 				if (!hadAssistantStart) {
 					this.#state.streamMessage = errorMsg;
 					this.#emit({ type: "message_start", message: errorMsg });
@@ -1274,8 +1375,40 @@ export class Agent {
 				this.appendMessage(errorMsg);
 				this.#state.error = errorMessage;
 				this.#emit({ type: "message_end", message: errorMsg });
-				this.#emit({ type: "turn_end", message: errorMsg, toolResults: [] });
-				this.#emit({ type: "agent_end", messages: [errorMsg] });
+				const toolResults: ToolResultMessage[] = [];
+				this.#cursorToolResultBuffer = [];
+				const bufferedCursorToolCallIds = new Set(bufferedCursorResults.map(({ toolCallId }) => toolCallId));
+				for (const toolResult of bufferedCursorResults) {
+					this.appendMessage(toolResult);
+					this.#emit({ type: "message_start", message: toolResult });
+					this.#emit({ type: "message_end", message: toolResult });
+					toolResults.push(toolResult);
+				}
+				for (const block of errorMsg.content) {
+					if (block.type !== "toolCall") continue;
+					if (bufferedCursorToolCallIds.has(block.id)) continue;
+					const toolResult = createSyntheticToolResultMessage(block, "error", errorMessage);
+					this.#emit({
+						type: "tool_execution_start",
+						toolCallId: block.id,
+						toolName: block.name,
+						args: block.arguments,
+						intent: block.intent,
+					});
+					this.#emit({
+						type: "tool_execution_end",
+						toolCallId: block.id,
+						toolName: block.name,
+						result: { content: toolResult.content, details: toolResult.details },
+						isError: true,
+					});
+					this.appendMessage(toolResult);
+					this.#emit({ type: "message_start", message: toolResult });
+					this.#emit({ type: "message_end", message: toolResult });
+					toolResults.push(toolResult);
+				}
+				this.#emit({ type: "turn_end", message: errorMsg, toolResults });
+				this.#emit({ type: "agent_end", messages: [errorMsg, ...toolResults] });
 			} else {
 				this.appendMessage(errorMsg);
 				this.#state.error = errorMessage;
@@ -1311,115 +1444,33 @@ export class Agent {
 		}
 	}
 
-	/** Calculate total text length from an assistant message's content blocks */
-	#getAssistantTextLength(message: AgentMessage | null): number {
-		if (message?.role !== "assistant" || !Array.isArray(message.content)) {
-			return 0;
-		}
-		let length = 0;
-		for (const block of message.content) {
-			if (block.type === "text") {
-				length += (block as TextContent).text.length;
-			}
-		}
-		return length;
-	}
-
 	/**
-	 * Emit a Cursor assistant message split around tool results.
-	 * This fixes the ordering issue where tool results appear after the full explanation.
+	 * Emit a Cursor assistant message with buffered exec-channel toolResults.
 	 *
-	 * Output order: Assistant(preamble) -> ToolResults -> Assistant(continuation)
+	 * Since the Cursor provider now synthesizes `toolCall` content blocks at the
+	 * point each exec tool starts (issue #4348), the assistant message content
+	 * already interleaves text/thinking with toolCall blocks in execution order.
+	 * We emit the message as-is and let the buffered toolResults follow — the
+	 * transcript rebuild in `renderSessionContext` pairs them by `toolCallId`.
+	 *
+	 * Historical note: this used to split the assistant message at
+	 * `textLengthAtCall` to interpose toolResults between preamble and
+	 * continuation. That workaround existed because native cursor tools had no
+	 * toolCall blocks; it also copied `preambleText` into every text block on
+	 * multi-text turns, producing duplicated text on replay.
 	 */
 	#emitCursorSplitAssistantMessage(assistantMessage: AssistantMessage): void {
 		const buffer = this.#cursorToolResultBuffer;
 		this.#cursorToolResultBuffer = [];
 
-		if (buffer.length === 0) {
-			// No tool results, emit normally
-			this.#state.streamMessage = null;
-			this.appendMessage(assistantMessage);
-			this.#emit({ type: "message_end", message: assistantMessage });
-			return;
-		}
-
-		// Find the split point: minimum text length at first tool call
-		const splitPoint = Math.min(...buffer.map(r => r.textLengthAtCall));
-
-		// Extract text content from assistant message
-		const content = assistantMessage.content;
-		let fullText = "";
-		for (const block of content) {
-			if (block.type === "text") {
-				fullText += block.text;
-			}
-		}
-
-		// If no text or split point is 0 or at/past end, don't split
-		if (fullText.length === 0 || splitPoint <= 0 || splitPoint >= fullText.length) {
-			// Emit assistant message first, then tool results (original behavior but with buffered results)
-			this.#state.streamMessage = null;
-			this.appendMessage(assistantMessage);
-			this.#emit({ type: "message_end", message: assistantMessage });
-
-			// Emit buffered tool results
-			for (const { toolResult } of buffer) {
-				this.#emit({ type: "message_start", message: toolResult });
-				this.appendMessage(toolResult);
-				this.#emit({ type: "message_end", message: toolResult });
-			}
-			return;
-		}
-
-		// Split the text
-		const preambleText = fullText.slice(0, splitPoint);
-		const continuationText = fullText.slice(splitPoint);
-
-		// Create preamble message (text before tools)
-		const preambleContent = content.map(block => {
-			if (block.type === "text") {
-				return { ...block, text: preambleText };
-			}
-			return block;
-		});
-		const preambleMessage: AssistantMessage = {
-			...assistantMessage,
-			content: preambleContent,
-		};
-
-		// Emit preamble
 		this.#state.streamMessage = null;
-		this.appendMessage(preambleMessage);
-		this.#emit({ type: "message_end", message: preambleMessage });
+		this.appendMessage(assistantMessage);
+		this.#emit({ type: "message_end", message: assistantMessage });
 
-		// Emit buffered tool results
 		for (const { toolResult } of buffer) {
 			this.#emit({ type: "message_start", message: toolResult });
 			this.appendMessage(toolResult);
 			this.#emit({ type: "message_end", message: toolResult });
-		}
-
-		// Emit continuation message (text after tools) if non-empty
-		const trimmedContinuation = continuationText.trim();
-		if (trimmedContinuation.length > 0) {
-			// Create continuation message with only text content (no thinking/toolCalls)
-			const continuationContent: TextContent[] = [{ type: "text", text: continuationText }];
-			const continuationMessage: AssistantMessage = {
-				...assistantMessage,
-				content: continuationContent,
-				// Zero out usage for continuation since it's part of same response
-				usage: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-			};
-			this.#emit({ type: "message_start", message: continuationMessage });
-			this.appendMessage(continuationMessage);
-			this.#emit({ type: "message_end", message: continuationMessage });
 		}
 	}
 }

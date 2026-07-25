@@ -26,6 +26,12 @@ The most capable agent surface that ships. Continuously tuned by real-world use 
 
 **40+** providers · **32** built-in tools · **14** lsp ops · **28** dap ops · **~55k** lines of Rust core.
 
+> [!NOTE]
+> Pull requests are **temporarily open to everyone** as a trial. We previously
+> required a vouch before accepting PRs; that requirement is lifted for now
+> while we evaluate how open contributions go. Depending on the results, the
+> vouch system may return.
+
 ## Install
 
 **macOS · Linux**
@@ -151,7 +157,7 @@ _[Watch the capture ↗](https://omp.sh/clips/collab.mp4)_
 
 ### 08 · Read a pdf on arxiv, why not?
 
-web_search chains fourteen ranked providers and hands whatever URLs it finds straight to read. Arxiv PDFs, GitHub pages, Stack Overflow threads come back as structured markdown with anchors intact — the same tool surface you use on local files. Cite, follow, quote, never lose where you came from.
+web_search chains eighteen ranked providers and hands whatever URLs it finds straight to read. Arxiv PDFs, GitHub pages, Stack Overflow threads come back as structured markdown with anchors intact — the same tool surface you use on local files. Cite, follow, quote, never lose where you came from.
 
 ![omp TUI: web_search returns 10 ranked Perplexity sources for inference-time compute scaling, the agent picks an arxiv paper, calls read https://arxiv.org/pdf/2604.10739v1, and summarizes the paper's headline result with real numbers.](https://omp.sh/clips/web-poster.webp)
 
@@ -219,7 +225,7 @@ Stealth's on by default, so pages see a normal user instead of a headless bot. T
 
 ## Whatever the task needs, _it's already in the box_.
 
-32 tools live in the same namespace as `read` and `bash`. Pin the active set with `--tools read,edit,bash,…` and the rest stay hidden but indexed — `search_tool_bm25` pulls them back in mid-session when `tools.discoveryMode` says so.
+32 tools live in the same namespace as `read` and `bash`. Pin the active set with `--tools read,edit,bash,…`; rarely used discoverable tools stay behind `xd://` devices. `read xd://` lists them, and `write xd://<tool>` runs one when `tools.xdev` is enabled.
 
 **Files & search**
 
@@ -245,9 +251,8 @@ Stealth's on by default, so pages see a normal user instead of a headless bot. T
 **Coordination**
 
 - `task` — fan out subagents in parallel, optionally workspace-isolated.
-- `irc` — short prose between live agents in this process.
+- `hub` — message live agents, wait on or cancel background jobs, and supervise long-running processes.
 - `todo` — ordered mutations over the session todo list with phase tracking.
-- `job` — wait on or cancel background jobs.
 - `ask` — structured follow-up questions for interactive runs.
 
 **Outside the box**
@@ -270,11 +275,27 @@ Stealth's on by default, so pages see a normal user instead of a headless bot. T
 **Misc**
 
 - `resolve` — apply or discard a queued preview action.
-- `search_tool_bm25` — BM25 over the hidden tool index; activates top matches mid-session.
 
-Setting-gated, off by default: `github`, `inspect_image`, `tts`, `checkpoint`, `rewind`, `search_tool_bm25`, `retain`, `recall`, `reflect`. Flip them on once, scoped per project.
+Setting-gated, off by default: `github`, `inspect_image`, `tts`, `checkpoint`, `rewind`, `retain`, `recall`, `reflect`. Flip them on once, scoped per project.
 
 [Full reference →](https://omp.sh/docs/tools)
+
+### Prompt controls
+
+Three standalone, lowercase words opt a turn into specialized agent behavior:
+
+- `ultrathink` — request careful multi-step reasoning and the highest supported automatic thinking effort.
+- `orchestrate` — run substantial independent work through parallel subagents and verify each phase.
+- `workflowz` — build a deterministic multi-subagent workflow with the active `task` tool.
+
+They trigger only in prose, not inside code spans, fenced code blocks, XML/HTML sections, identifiers, or paths. See [Magic keywords](docs/magic-keywords.md) for exact matching rules and configuration.
+
+### Session controls
+
+Slash commands shift how a whole session runs:
+
+- `/vibe` — enter [Vibe mode](docs/vibe-mode.md): act as a director driving persistent `fast`/`good` worker sessions with a `read`-only toolset.
+- `/fresh` — reset the provider stream state (stale prompt cache, wedged stream) without changing the local transcript. See [Session operations](docs/session-operations-export-share-fork-resume.md#fresh).
 
 ## Forty-plus providers, hundreds of models, _one /model away_.
 
@@ -292,7 +313,7 @@ Anthropic `oauth` · OpenAI · OpenAI Codex `oauth` · Google Gemini · Google A
 
 Subscription-routed. `/login` attaches the session.
 
-Cursor `oauth` · GitHub Copilot `oauth` · GitLab Duo · Kimi Code `plan` · Moonshot · MiniMax Coding Plan `plan` · MiniMax Coding Plan CN `plan` · Alibaba Coding Plan `plan` · Qwen Portal · Z.AI / GLM Coding Plan `plan` · Xiaomi MiMo · Qianfan · NanoGPT · Venice · Kilo · ZenMux · OpenCode Go · OpenCode Zen
+Cursor `oauth` · GitHub Copilot `oauth` · GitLab Duo · Kimi Code `plan` · Moonshot · MiniMax Coding Plan `plan` · MiniMax Coding Plan CN `plan` · Alibaba Coding Plan `plan` · Qwen Portal · Z.AI / GLM Coding Plan `plan` · Xiaomi MiMo · Qianfan · NanoGPT · Novita · Venice · Kilo · ZenMux · OpenCode Go · OpenCode Zen
 
 ### Run it yourself
 
@@ -300,40 +321,77 @@ OpenAI-compatible `/v1/models`. Local instances skip the key.
 
 Ollama `local` · Ollama Cloud · LM Studio `local` · llama.cpp `local` · vLLM `local` · LiteLLM
 
+### Custom OpenAI-compatible providers
+
+Define custom providers in `~/.omp/agent/models.yml`:
+
+```yaml
+providers:
+  spark:
+    baseUrl: http://192.168.10.223:8000/v1
+    api: openai-completions
+    apiKey: dummy
+    models:
+      - id: minimax-m3
+        name: MiniMax M3
+        contextWindow: 100000
+        maxTokens: 32000
+```
+
+Run `omp models spark` to verify discovery. Then run `omp setup` and choose the model in the default-model step, or open `/model` in a session and assign it to the `default` role.
+
+To preconfigure the default without the picker, add the selector to `~/.omp/agent/config.yml`:
+
+```yaml
+modelRoles:
+  default: spark/minimax-m3
+```
+
 ### Four knobs that make routing useful
 
 - **Custom providers** — Declare anything that speaks `openai-completions`, `openai-responses`, `openai-codex-responses`, `azure-openai-responses`, `anthropic-messages`, `google-generative-ai`, or `google-vertex` in `~/.omp/agent/models.yml`.
-- **Fallback chains** — Per-role chains under `retry.fallbackChains`. When the primary throws 429s or hits a quota wall, the next entry takes the rest of the turn — restored on cooldown.
+- **Fallback chains** — Per-role or per-model chains under `retry.fallbackChains`. When the primary throws 429s or hits a quota wall, the next entry takes the rest of the turn — restored on cooldown.
 - **Path-scoped models** — Scope `enabledModels` and `disabledProviders` entries to a `path:` prefix to pin a different model set on one repo without touching the global config. Scoped entries cover the path and everything under it.
 - **Round-robin credentials** — Stack API keys per provider and the runtime rotates with session affinity and per-credential backoff. Useful when one key would burn its quota by lunch.
 
 Full provider & routing reference at [omp.sh/docs/providers](https://omp.sh/docs/providers).
 
-## Fourteen backends. _One tool the agent already knows_.
+## Twenty-five backends. _One tool the agent already knows_.
 
-`web_search` is built in, not bolted on. `auto` walks a fourteen-provider chain; pin one by name if you already pay for it. Behind every hit, site-aware extraction turns GitHub, registries, arXiv, Stack Overflow, and docs into structured markdown — anchors and link targets survive.
+`web_search` is built in, not bolted on. `auto` walks a twenty-five-provider chain; pin one by name if you already pay for it. Behind every hit, site-aware extraction turns GitHub, registries, arXiv, Stack Overflow, and docs into structured markdown — anchors and link targets survive.
 
 ### Search providers
 
-Fourteen backends. Pin one, or let `auto` walk the chain in order.
+Twenty-five backends. Pin one, or let `auto` walk the chain in order.
 
 | provider     | auth                   |
 | ------------ | ---------------------- |
 | `auto`       | chain                  |
-| `exa`        | `EXA_API_KEY` (or mcp) |
-| `brave`      | `BRAVE_API_KEY`        |
-| `jina`       | `JINA_API_KEY`         |
-| `kimi`       | `MOONSHOT_API_KEY`     |
-| `zai`        | `ZAI_API_KEY`          |
-| `anthropic`  | oauth                  |
 | `perplexity` | `PERPLEXITY_API_KEY`   |
 | `gemini`     | oauth                  |
+| `anthropic`  | oauth                  |
 | `codex`      | oauth                  |
-| `tavily`     | `TAVILY_API_KEY`       |
-| `parallel`   | `PARALLEL_API_KEY`     |
+| `xai`        | `XAI_API_KEY`          |
+| `zai`        | `ZAI_API_KEY`          |
+| `exa`        | `EXA_API_KEY` (or mcp) |
+| `tinyfish`   | `TINYFISH_API_KEY`     |
+| `jina`       | `JINA_API_KEY`         |
 | `kagi`       | `KAGI_API_KEY`         |
+| `tavily`     | `TAVILY_API_KEY`       |
+| `firecrawl`  | `FIRECRAWL_API_KEY`    |
+| `brave`      | `BRAVE_API_KEY`        |
+| `kimi`       | `MOONSHOT_API_KEY`     |
+| `parallel`   | `PARALLEL_API_KEY`     |
 | `synthetic`  | `SYNTHETIC_API_KEY`    |
 | `searxng`    | self-hosted            |
+| `duckduckgo` | no key                 |
+| `bing`       | no key                 |
+| `yahoo`      | no key                 |
+| `startpage`  | no key                 |
+| `google`     | no key (browser)       |
+| `ecosia`     | no key (browser)       |
+| `mojeek`     | no key (browser)       |
+| `public`     | no key (all of the above, consolidated) |
 
 ### Specialised handlers
 
@@ -536,23 +594,21 @@ For architecture and contribution guidelines, see [packages/coding-agent/DEVELOP
 
 ### Rust Crates
 
-| Crate                                                         | Description                                                                                         |
-| ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| **[pi-natives](crates/pi-natives)**                           | Core Rust native addon (N-API `cdylib`) used by `@oh-my-pi/pi-natives`; aggregates the crates below |
-| **[pi-shell](crates/pi-shell)**                               | Embedded shell / PTY / process management split out of `pi-natives` (wraps `brush-*`)               |
-| **[pi-ast](crates/pi-ast)**                                   | tree-sitter-based code summarizer and AST utilities (50+ language grammars)                         |
-| **[pi-iso](crates/pi-iso)**                                   | Task isolation backend resolver: APFS clones, btrfs/zfs reflinks, overlayfs, projfs, rcopy          |
-| **[brush-core-vendored](crates/brush-core-vendored)**         | Vendored fork of [brush-shell](https://github.com/reubeno/brush) for embedded bash execution        |
-| **[brush-builtins-vendored](crates/brush-builtins-vendored)** | Vendored bash builtins (cd, echo, test, printf, read, export, etc.)                                 |
+| Crate                                              | Description                                                                                         |
+| -------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| **[pi-natives](crates/pi-natives)**                | Core Rust native addon (N-API `cdylib`) used by `@oh-my-pi/pi-natives`; aggregates the crates below |
+| **[pi-shell](crates/pi-shell)**                    | Embedded shell / PTY / process management split out of `pi-natives` (wraps `brush-*`)               |
+| **[pi-ast](crates/pi-ast)**                        | tree-sitter-based code summarizer and AST utilities (50+ language grammars)                         |
+| **[pi-iso](crates/pi-iso)**                        | Task isolation backend resolver: APFS clones, btrfs/zfs reflinks, overlayfs, projfs, rcopy          |
+| **[brush-core](crates/vendor/brush-core)**         | Vendored fork of [brush-shell](https://github.com/reubeno/brush) for embedded bash execution        |
+| **[brush-builtins](crates/vendor/brush-builtins)** | Vendored bash builtins (cd, echo, test, printf, read, export, etc.)                                 |
 
 ## Contributing
 
-Issues are open to everyone. **Pull requests require a vouch** — PRs from
-unvouched or denounced authors are closed automatically. If you're not yet
-vouched, open a [Discussion](https://github.com/can1357/oh-my-pi/discussions)
-and ask a maintainer to `!vouch` you rather than opening a PR (which would be
-closed on sight). See **[CONTRIBUTING.md](CONTRIBUTING.md)** and
-[`.github/VOUCHED.td`](.github/VOUCHED.td) for the full policy.
+Issues and pull requests are open to everyone. Open PRs are currently a
+**trial** — the previous vouch requirement is lifted while we evaluate how it
+goes, and it may return. See **[CONTRIBUTING.md](CONTRIBUTING.md)** for
+guidelines on contributing.
 
 ---
 

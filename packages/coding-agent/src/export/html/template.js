@@ -1,6 +1,27 @@
     (function() {
       'use strict';
 
+      const THEME_STORAGE_KEY = 'omp-export-theme';
+      const themeSelect = document.getElementById('theme-select');
+      let themePreference = 'auto';
+      try {
+        const stored = localStorage.getItem(THEME_STORAGE_KEY);
+        if (stored === 'light' || stored === 'dark' || stored === 'auto') themePreference = stored;
+      } catch {}
+
+      function applyThemePreference(next) {
+        themePreference = next;
+        if (next === 'light' || next === 'dark') document.documentElement.dataset.theme = next;
+        else delete document.documentElement.dataset.theme;
+        if (themeSelect) themeSelect.value = next;
+        try {
+          localStorage.setItem(THEME_STORAGE_KEY, next);
+        } catch {}
+      }
+
+      applyThemePreference(themePreference);
+      if (themeSelect) themeSelect.addEventListener('change', () => applyThemePreference(themeSelect.value));
+
       // ============================================================
       // BOOT
       // ============================================================
@@ -102,14 +123,18 @@
           }
         }
 
-        // Sort children by timestamp
-        function sortChildren(node) {
+        // Sort children by timestamp. Use an explicit stack so valid, deep
+        // conversation chains do not exhaust the browser call stack.
+        const sortStack = [...roots];
+        while (sortStack.length > 0) {
+          const node = sortStack.pop();
           node.children.sort((a, b) =>
             new Date(a.entry.timestamp).getTime() - new Date(b.entry.timestamp).getTime()
           );
-          node.children.forEach(sortChildren);
+          for (let i = node.children.length - 1; i >= 0; i--) {
+            sortStack.push(node.children[i]);
+          }
         }
-        roots.forEach(sortChildren);
 
         return roots;
       }
@@ -157,17 +182,27 @@
         const result = [];
         const multipleRoots = roots.length > 1;
 
-        // Mark which subtrees contain the active leaf
+        // Mark which subtrees contain the active leaf. Use iterative post-order
+        // traversal so valid, deep conversation chains do not exhaust the
+        // browser call stack.
         const containsActive = new Map();
-        function markActive(node) {
+        const allNodes = [];
+        const activeStack = [...roots];
+        while (activeStack.length > 0) {
+          const node = activeStack.pop();
+          allNodes.push(node);
+          for (let i = node.children.length - 1; i >= 0; i--) {
+            activeStack.push(node.children[i]);
+          }
+        }
+        for (let i = allNodes.length - 1; i >= 0; i--) {
+          const node = allNodes[i];
           let has = activePathIds.has(node.entry.id);
           for (const child of node.children) {
-            if (markActive(child)) has = true;
+            if (containsActive.get(child)) has = true;
           }
           containsActive.set(node, has);
-          return has;
         }
-        roots.forEach(markActive);
 
         // Stack: [node, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild]
         const stack = [];
@@ -433,10 +468,12 @@
             const cmd = rawCmd.replace(/[\n\t]/g, ' ').trim().slice(0, 50);
             return `[bash: ${cmd}${rawCmd.length > 50 ? '...' : ''}]`;
           }
+          case 'search':
           case 'grep':
             return `[grep: /${args.pattern || ''}/ in ${shortenPath(String((args.paths || [args.path || '.']).join(', ')))}]`;
           case 'find':
-            return `[find: ${shortenPath(String((args.paths || [args.pattern || '.']).join(', ')))}]`;
+          case 'glob':
+            return `[glob: ${shortenPath(String((args.paths || [args.pattern || '.']).join(', ')))}]`;
           case 'ls':
             return `[ls: ${shortenPath(String(args.path || '.'))}]`;
           default: {
@@ -1080,6 +1117,8 @@
                   <div class="thinking-text">${escapeHtml(thinking)}</div>
                   <div class="thinking-collapsed">Thinking ...</div>
                 </div>`;
+              } else if (block.type === 'image') {
+                html += `<div class="message-images"><img src="data:${block.mimeType};base64,${block.data}" class="message-image" /></div>`;
               }
             }
             for (const block of msg.content) {
@@ -1234,7 +1273,7 @@
         let html = `
           <div class="header">
             <h1>Session: ${escapeHtml(header?.id || 'unknown')}</h1>
-            <div class="help-bar">Ctrl+T toggle thinking · Ctrl+O toggle tools</div>
+            <div class="help-bar">T toggle thinking · O toggle tools</div>
             <div class="header-info">
               <div class="info-item"><span class="info-label">Date:</span><span class="info-value">${header?.timestamp ? new Date(header.timestamp).toLocaleString() : 'unknown'}</span></div>
               <div class="info-item"><span class="info-label">Models:</span><span class="info-value">${globalStats.models.join(', ') || 'unknown'}</span></div>
@@ -1384,7 +1423,7 @@
           },
           // Text content: escape HTML tags
           text(token) {
-            return escapeHtmlTags(escapeHtml(token.text));
+            return token.tokens ? this.parser.parseInline(token.tokens) : escapeHtmlTags(escapeHtml(token.text));
           },
           // Inline code: escape HTML
           codespan(token) {
@@ -1578,13 +1617,19 @@
           searchQuery = '';
           navigateTo(leafId, 'bottom');
         }
-        if (e.ctrlKey && e.key === 't') {
+        if (e.key === 't' || e.key === 'T' || e.key === 'o' || e.key === 'O') {
+          // Skip when typing in the sidebar search (or any other editable target)
+          // so the chord can't fire on a user's letter input. Avoid Ctrl/Cmd-based
+          // chords entirely — every major browser reserves Ctrl+T (new tab) and
+          // Ctrl+O (open file), so the shortcut would never reach the page.
+          const t = e.target;
+          const editable =
+            t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
+          if (editable) return;
+          if (e.ctrlKey || e.metaKey || e.altKey) return;
           e.preventDefault();
-          toggleThinking();
-        }
-        if (e.ctrlKey && e.key === 'o') {
-          e.preventDefault();
-          toggleToolOutputs();
+          if (e.key === 't' || e.key === 'T') toggleThinking();
+          else toggleToolOutputs();
         }
       });
 

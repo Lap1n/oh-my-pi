@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { Agent, type AgentMessage, type AgentTool, AppendOnlyContextManager } from "@oh-my-pi/pi-agent-core";
+import {
+	Agent,
+	type AgentMessage,
+	type AgentTool,
+	AppendOnlyContextManager,
+	type StreamFn,
+} from "@oh-my-pi/pi-agent-core";
 import {
 	type Api,
 	type Context,
@@ -14,12 +20,15 @@ import {
 } from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as memoryBackend from "@oh-my-pi/pi-coding-agent/memory-backend";
 import type { MemoryBackend } from "@oh-my-pi/pi-coding-agent/memory-backend/types";
 import { type MnemopiSessionState, setMnemopiSessionState } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
+import { createAgentSession, type ExtensionFactory } from "@oh-my-pi/pi-coding-agent/sdk";
 import { obfuscateProviderContext, SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -128,6 +137,9 @@ describe("AgentSession message pipeline", () => {
 			modelRegistry: {} as never,
 		});
 		sessions.push(session);
+		// #queueUserMessage schedules an idle-queue drain that would agent.continue()
+		// and pop the steer before we can inspect it; stub it out to observe the queue.
+		vi.spyOn(session.agent, "continue").mockResolvedValue(undefined);
 
 		await session.sendUserMessage("raw <steer> &", { deliverAs: "steer" });
 
@@ -224,7 +236,7 @@ describe("AgentSession message pipeline", () => {
 		expect(requestOnPayload).toHaveBeenCalledWith({ original: true, session: true }, undefined);
 		expect(result).toEqual({ original: true, session: true });
 	});
-	it("keeps ephemeral side-channel cache key separate from provider routing", async () => {
+	it("keeps ephemeral side-channel cache key separate from provider routing while preserving websocket state", async () => {
 		const api = "test-ephemeral-side-channel";
 		let capturedOptions: SimpleStreamOptions | undefined;
 		registerCustomApi(api, (_model, _context, options) => {
@@ -262,6 +274,7 @@ describe("AgentSession message pipeline", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: createModelRegistryStub() as never,
+			preferWebsockets: true,
 		});
 		sessions.push(session);
 		const cacheSessionId = session.sessionId;
@@ -272,7 +285,57 @@ describe("AgentSession message pipeline", () => {
 		expect(capturedOptions?.promptCacheKey).toBe(cacheSessionId);
 		expect(capturedOptions?.sessionId).toStartWith(`${cacheSessionId}:side:`);
 		expect(capturedOptions?.sessionId).not.toBe(cacheSessionId);
-		expect(capturedOptions?.preferWebsockets).toBe(false);
+		expect(capturedOptions?.preferWebsockets).toBe(true);
+		expect(capturedOptions?.providerSessionState).toBe(session.providerSessionState);
+	});
+
+	it("runs ephemeral side-channel requests through the configured side stream function", async () => {
+		const model = buildModel({
+			id: "side-stream-model",
+			name: "Side Stream Model",
+			api: "anthropic",
+			provider: "test-provider",
+			baseUrl: "",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		let capturedOptions: SimpleStreamOptions | undefined;
+		let capturedContext: Context | undefined;
+		const sideStreamFn: StreamFn = (_model, context, options) => {
+			capturedContext = context;
+			capturedOptions = options;
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage("Side answer");
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "Side answer", partial: message });
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		};
+		const session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model,
+					systemPrompt: ["system prompt"],
+					messages: [],
+					tools: [],
+				},
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: createModelRegistryStub() as never,
+			sideStreamFn,
+		});
+		sessions.push(session);
+
+		const result = await session.runEphemeralTurn({ promptText: "Question?" });
+
+		expect(result.replyText).toBe("Side answer");
+		expect(capturedContext?.messages.at(-1)?.content).toEqual([{ type: "text", text: "Question?" }]);
+		expect(capturedOptions?.sessionId).toStartWith(`${session.sessionId}:side:`);
 	});
 
 	it("rotates ephemeral side-channel credentials on Google Resource exhausted", async () => {
@@ -687,6 +750,94 @@ describe("AgentSession message pipeline", () => {
 		expect(firstSystemPrompt).toBeDefined();
 		expect(firstSystemPrompt!.join("\n")).toContain(injected);
 		expect(contexts[1]!.systemPrompt).toEqual(firstSystemPrompt);
+	});
+
+	it("preserves append-only prefixes in subagent sessions when context handlers rewrite prior turns", async () => {
+		using tempDir = TempDir.createSync("@pi-subagent-append-only-");
+		const api = "test-subagent-append-only-cache";
+		const contexts: Context[] = [];
+		registerCustomApi(api, (_model, context) => {
+			contexts.push(context);
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage(`ok-${contexts.length}`);
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "ok", partial: message });
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		});
+		const model = buildModel({
+			id: "local-subagent-model",
+			name: "Local Subagent Model",
+			api,
+			provider: "llama.cpp",
+			baseUrl: "http://127.0.0.1:8080/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const rewritePriorAssistant: ExtensionFactory = pi => {
+			pi.on("context", async event => {
+				const hasSecondTurn = event.messages.some(message => {
+					if (message.role !== "user") return false;
+					const content = message.content;
+					if (typeof content === "string") return content.includes("second");
+					return content.some(part => part.type === "text" && part.text.includes("second"));
+				});
+				if (!hasSecondTurn) return undefined;
+				return {
+					messages: event.messages.map(message =>
+						message.role === "assistant"
+							? { ...message, content: [{ type: "text" as const, text: "rewritten assistant" }] }
+							: message,
+					),
+				};
+			});
+		};
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		const { session } = await createAgentSession({
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+			authStorage,
+			modelRegistry,
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"provider.appendOnlyContext": "auto",
+			}),
+			model,
+			disableExtensionDiscovery: true,
+			extensions: [rewritePriorAssistant],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			taskDepth: 1,
+			agentId: "SubAgent",
+		});
+		try {
+			expect(session.agent.appendOnlyContext).toBeDefined();
+
+			await session.sendUserMessage("first");
+			await session.sendUserMessage("second");
+
+			expect(contexts).toHaveLength(2);
+			expect(contexts[0]!.messages).toHaveLength(1);
+			expect(contexts[1]!.messages).toHaveLength(3);
+			expect(contexts[1]!.messages[0]).toBe(contexts[0]!.messages[0]);
+			expect((contexts[1]!.messages[1] as { content: unknown }).content).toEqual([
+				{ type: "text", text: "rewritten assistant" },
+			]);
+		} finally {
+			await session.dispose();
+			authStorage.close();
+		}
 	});
 
 	it("clears promoted memory from the base prompt when switching sessions", async () => {

@@ -4,11 +4,15 @@
  * paid for. Regression guard for issue #2190.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type { Model } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolPathWithSource } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -28,6 +32,7 @@ function createMockSession(onPrompt: (params: { emit: (event: AgentSessionEvent)
 		extensionRunner: undefined,
 		sessionManager: { appendSessionInit: () => {} },
 		getActiveToolNames: () => ["read", "yield"],
+		getEnabledToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async (_toolNames: string[]) => {},
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			listeners.push(listener);
@@ -88,6 +93,15 @@ const baseOptions = {
 	modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
 	enableLsp: false,
 };
+
+function createModelRegistry(model: Model): ModelRegistry {
+	return {
+		authStorage: {},
+		refresh: async () => {},
+		getAvailable: () => [model],
+		getApiKey: async () => "test-key",
+	} as unknown as ModelRegistry;
+}
 
 describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 	afterEach(() => {
@@ -151,5 +165,117 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(forwarded?.parentAgentId).toBe("SpawnerAgent");
 		expect(forwarded?.agentId).toBe("ChildAgent");
 		expect(forwarded?.parentTaskPrefix).toBe("ChildAgent");
+	});
+
+	it("removes all MCP and discovered capability sources for a restricted child", async () => {
+		const session = yieldEmittingSession();
+		const persistedInits: Array<{ restrictToolNames?: boolean; tools: string[] }> = [];
+		vi.spyOn(session.sessionManager, "appendSessionInit").mockImplementation(init => {
+			persistedInits.push(init);
+			return "session-init";
+		});
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const preloadedExtensionPaths = ["/hostile/extensions/read.ts"];
+		const preloadedCustomToolPaths: ToolPathWithSource[] = [
+			{ path: "/hostile/tools/read.ts", source: { provider: "test", providerName: "Test", level: "project" } },
+		];
+		const getTools = vi.fn(() => [{ name: "read", label: "hostile/read" }]);
+		const mcpManager = { getTools } as unknown as MCPManager;
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "restricted-child",
+			restrictToolNames: true,
+			mcpManager,
+			preloadedExtensionPaths,
+			preloadedCustomToolPaths,
+			outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
+			outputSchemaMode: "strict",
+		});
+
+		expect(result.exitCode).toBe(0);
+		const forwarded = spy.mock.calls[0]?.[0];
+		expect(forwarded?.restrictToolNames).toBe(true);
+		expect(forwarded?.enableMCP).toBe(false);
+		expect(forwarded?.mcpManager).toBeUndefined();
+		expect(forwarded?.customTools).toBeUndefined();
+		expect(forwarded?.preloadedExtensionPaths).toEqual([]);
+		expect(forwarded?.preloadedCustomToolPaths).toEqual([]);
+		expect(getTools).not.toHaveBeenCalled();
+		expect(forwarded?.outputSchemaMode).toBe("strict");
+		expect(persistedInits).toHaveLength(1);
+		expect(persistedInits[0]).toMatchObject({ restrictToolNames: true, tools: ["read", "yield"] });
+	});
+
+	it("retains inherited MCP proxy tools for normal children", async () => {
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const mcpManager = {
+			getTools: () => [{ name: "mcp__private_read", label: "private/read" }],
+		} as unknown as MCPManager;
+
+		const result = await runSubprocess({ ...baseOptions, id: "normal-child", mcpManager });
+
+		expect(result.exitCode).toBe(0);
+		const forwarded = spy.mock.calls[0]?.[0];
+		expect(forwarded?.enableMCP).toBe(true);
+		expect(forwarded?.mcpManager).toBe(mcpManager);
+		expect(forwarded?.customTools?.map(tool => tool.name)).toEqual(["mcp__private_read"]);
+	});
+
+	it("preserves the legacy result shape when no output schema is selected", async () => {
+		const session = yieldEmittingSession();
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({ ...baseOptions, id: "legacy-output-child" });
+
+		expect(result.exitCode).toBe(0);
+		expect(Object.hasOwn(result, "structuredOutput")).toBe(false);
+	});
+
+	it("resolves an explicit task-role effort suffix over the agent-definition default", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+		const settings = Settings.isolated();
+		settings.setModelRole("task", `${model.provider}/${model.id}:high`);
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({
+			...baseOptions,
+			agent: { ...baseAgent, model: ["@task"] },
+			id: "subagent-thinking-precedence",
+			settings,
+			modelRegistry: createModelRegistry(model),
+			thinkingLevel: ThinkingLevel.Low,
+		});
+
+		expect(result.exitCode).toBe(0);
+		const forwarded = spy.mock.calls[0]?.[0];
+		// The user's explicit `:high` suffix on the resolved role pattern wins over
+		// the agent definition's default level (e.g. task's `auto`).
+		expect(forwarded?.thinkingLevel).toBe(ThinkingLevel.High);
+	});
+
+	it("falls back to the agent-definition thinking level without an explicit suffix", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+		const settings = Settings.isolated();
+		settings.setModelRole("task", `${model.provider}/${model.id}`);
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({
+			...baseOptions,
+			agent: { ...baseAgent, model: ["@task"] },
+			id: "subagent-thinking-default",
+			settings,
+			modelRegistry: createModelRegistry(model),
+			thinkingLevel: ThinkingLevel.Low,
+		});
+
+		expect(result.exitCode).toBe(0);
+		const forwarded = spy.mock.calls[0]?.[0];
+		expect(forwarded?.thinkingLevel).toBe(ThinkingLevel.Low);
 	});
 });

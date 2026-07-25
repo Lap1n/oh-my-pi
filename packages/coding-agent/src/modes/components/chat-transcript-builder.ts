@@ -29,11 +29,13 @@ import type { SessionMessageEntry } from "../../session/session-entries";
 import { theme } from "../theme/theme";
 import {
 	assistantHasVisibleContent,
+	assistantUsageIsBilled,
 	buildAsyncResultBlock,
 	buildFileMentionBlock,
 	buildIrcMessageCard,
 	normalizeToolArgs,
-	resolveAssistantErrorMessage,
+	resolveAssistantErrorPresentation,
+	splitAssistantMessageToolTimeline,
 } from "../utils/transcript-render-helpers";
 import { createAdvisorMessageCard } from "./advisor-message";
 import { AssistantMessageComponent } from "./assistant-message";
@@ -49,12 +51,12 @@ import {
 import { CustomMessageComponent } from "./custom-message";
 import { EvalExecutionComponent } from "./eval-execution";
 import { type LateDiagnosticsFile, LateDiagnosticsMessageComponent } from "./late-diagnostics-message";
-import { ReadToolGroupComponent, readArgsHaveTarget, readArgsTargetInternalUrl } from "./read-tool-group";
+import { ReadToolGroupComponent, readArgsCollapseIntoGroup } from "./read-tool-group";
 import { SkillMessageComponent } from "./skill-message";
 import { ToolExecutionComponent } from "./tool-execution";
 import { TranscriptContainer } from "./transcript-container";
 import { createUsageRowBlock } from "./usage-row";
-import { UserMessageComponent } from "./user-message";
+import { CollapsedSyntheticMessageComponent, UserMessageComponent } from "./user-message";
 
 export interface ChatTranscriptBuilderDeps {
 	ui: TUI;
@@ -81,8 +83,12 @@ export class ChatTranscriptBuilder {
 	#readArgs = new Map<string, Record<string, unknown>>();
 	#readGroup: ReadToolGroupComponent | null = null;
 	#pendingUsage: Usage | undefined;
+	#pendingUsageDuration: number | undefined;
+	#pendingUsageTtft: number | undefined;
+	#pendingUsageTimestamp: number | undefined;
 	#lastAssistantUsage: Usage | undefined;
 	#waitingPoll: ToolExecutionComponent | null = null;
+	#todoSnapshot: ToolExecutionComponent | null = null;
 	#expandables: Array<{ setExpanded(expanded: boolean): void }> = [];
 	#expanded = false;
 
@@ -103,6 +109,12 @@ export class ChatTranscriptBuilder {
 		if (this.#readArgs.size === 0 && this.#pendingTools.size === 0) this.#flushPendingUsage();
 	}
 
+	/** Append newly persisted entries without rebuilding already rendered rows. */
+	append(entries: SessionMessageEntry[]): void {
+		for (const entry of entries) this.#appendChatMessage(entry.message);
+		if (this.#readArgs.size === 0 && this.#pendingTools.size === 0) this.#flushPendingUsage();
+	}
+
 	/** Toggle tool-output expansion across every expandable component. */
 	setExpanded(expanded: boolean): void {
 		this.#expanded = expanded;
@@ -120,8 +132,12 @@ export class ChatTranscriptBuilder {
 		this.#readArgs.clear();
 		this.#readGroup = null;
 		this.#pendingUsage = undefined;
+		this.#pendingUsageDuration = undefined;
+		this.#pendingUsageTtft = undefined;
+		this.#pendingUsageTimestamp = undefined;
 		this.#lastAssistantUsage = undefined;
 		this.#waitingPoll = null;
+		this.#todoSnapshot = null;
 		this.#expandables = [];
 		this.container.dispose();
 		this.container.clear();
@@ -136,14 +152,34 @@ export class ChatTranscriptBuilder {
 		this.#expandables.push(component);
 	}
 
-	/** A `job` poll showing all-running is displaced by the next `job` call. */
+	/** A `hub` wait showing all-running is displaced by the next `hub` call. */
 	#resolveWaitingPoll(nextToolName?: string): void {
 		const previous = this.#waitingPoll;
 		if (!previous) return;
 		this.#waitingPoll = null;
-		if (nextToolName === "job" && previous.isDisplaceableBlock()) {
+		if (nextToolName === "hub" && previous.isDisplaceableBlock() && this.container.isBlockUncommitted(previous)) {
 			this.container.removeChild(previous);
 		}
+		previous.seal();
+	}
+
+	#resolveTodoSnapshot(nextToolName?: string): void {
+		const previous = this.#todoSnapshot;
+		if (!previous) return;
+		if (!previous.isDisplaceableBlock()) {
+			this.#todoSnapshot = null;
+			return;
+		}
+		if (previous.canBeDisplacedBy(nextToolName)) {
+			this.#todoSnapshot = null;
+			if (this.container.isBlockUncommitted(previous)) {
+				this.container.removeChild(previous);
+			}
+			previous.seal();
+			return;
+		}
+		if (nextToolName !== undefined) return;
+		this.#todoSnapshot = null;
 		previous.seal();
 	}
 
@@ -166,8 +202,18 @@ export class ChatTranscriptBuilder {
 		if (!this.#pendingUsage) return;
 		this.#readGroup?.seal();
 		this.#readGroup = null;
-		this.container.addChild(createUsageRowBlock(this.#pendingUsage));
+		this.container.addChild(
+			createUsageRowBlock(
+				this.#pendingUsage,
+				this.#pendingUsageDuration,
+				this.#pendingUsageTtft,
+				this.#pendingUsageTimestamp,
+			),
+		);
 		this.#pendingUsage = undefined;
+		this.#pendingUsageDuration = undefined;
+		this.#pendingUsageTtft = undefined;
+		this.#pendingUsageTimestamp = undefined;
 	}
 
 	#appendChatMessage(message: AgentMessage): void {
@@ -183,10 +229,22 @@ export class ChatTranscriptBuilder {
 			case "developer": {
 				// A user prompt closes the poll-displacement window, same as the live path.
 				if (message.role === "user") this.#resolveWaitingPoll();
+				if (message.role === "user") this.#resolveTodoSnapshot();
 				const textContent = message.role === "user" ? userMessageText(message) : "";
 				if (textContent) {
 					const isSynthetic = message.role === "developer" ? true : (message.synthetic ?? false);
-					this.container.addChild(new UserMessageComponent(textContent, isSynthetic));
+					// Synthetic (agent-attributed) inputs — chiefly the advisor's `Session
+					// update` replay dumps — can be hundreds of KiB of Markdown each.
+					// Rendering their full body on cold open blocked the TUI (issue #6308);
+					// collapse them behind a compact summary that builds Markdown only on
+					// ctrl+o expand. Real user prompts stay fully rendered.
+					if (isSynthetic) {
+						const collapsed = new CollapsedSyntheticMessageComponent(textContent);
+						this.#trackExpandable(collapsed);
+						this.container.addChild(collapsed);
+					} else {
+						this.container.addChild(new UserMessageComponent(textContent, false));
+					}
 				}
 				break;
 			}
@@ -233,14 +291,18 @@ export class ChatTranscriptBuilder {
 	}
 
 	#appendAssistantMessage(message: Extract<AgentMessage, { role: "assistant" }>): void {
+		const hideThinkingBlock = this.deps.hideThinkingBlock?.() ?? false;
+		const proseOnlyThinking = this.deps.proseOnlyThinking ? this.deps.proseOnlyThinking() : true;
+		const timeline = splitAssistantMessageToolTimeline(message);
 		const assistantComponent = new AssistantMessageComponent(
-			message,
-			this.deps.hideThinkingBlock?.() ?? false,
+			timeline.beforeTools,
+			hideThinkingBlock,
 			() => this.deps.requestRender(),
 			this.deps.getMessageRenderer ? undefined : [], // placeholder for thinkingRenderers
-			undefined, // placeholder for imageBudget
-			this.deps.proseOnlyThinking ? this.deps.proseOnlyThinking() : true,
+			this.deps.ui.imageBudget,
+			proseOnlyThinking,
 		);
+		assistantComponent.setImagesVisible(settings.get("terminal.showImages"));
 		this.container.addChild(assistantComponent);
 
 		if (settings.get("display.cacheMissMarker")) {
@@ -258,17 +320,29 @@ export class ChatTranscriptBuilder {
 			this.#readGroup = null;
 		}
 
-		const { hasErrorStop, errorMessage } = resolveAssistantErrorMessage(message);
+		const errorPresentation = resolveAssistantErrorPresentation(message);
+		const hasErrorStop = errorPresentation.kind === "full";
+		const errorMessage = hasErrorStop ? errorPresentation.text : null;
+		const appendAssistantSegment = (segment: Extract<AgentMessage, { role: "assistant" }> | undefined) => {
+			if (!segment || !assistantHasVisibleContent(segment)) return;
+			const component = new AssistantMessageComponent(
+				segment,
+				hideThinkingBlock,
+				() => this.deps.requestRender(),
+				this.deps.getMessageRenderer ? undefined : [],
+				undefined,
+				proseOnlyThinking,
+			);
+			component.setImagesVisible(settings.get("terminal.showImages"));
+			this.container.addChild(component);
+		};
 
 		for (const content of message.content) {
 			if (content.type !== "toolCall") continue;
 			this.#resolveWaitingPoll(content.name);
 
-			if (
-				content.name === "read" &&
-				readArgsHaveTarget(content.arguments) &&
-				!readArgsTargetInternalUrl(content.arguments)
-			) {
+			const afterToolSegment = timeline.afterToolCalls.get(content.id);
+			if (content.name === "read" && readArgsCollapseIntoGroup(content.arguments)) {
 				if (hasErrorStop && errorMessage) {
 					const group = this.#ensureReadGroup();
 					group.updateArgs(content.arguments, content.id);
@@ -277,10 +351,15 @@ export class ChatTranscriptBuilder {
 						false,
 						content.id,
 					);
+				} else if (afterToolSegment) {
+					const group = this.#ensureReadGroup();
+					group.updateArgs(content.arguments, content.id);
+					this.#pendingTools.set(content.id, group);
 				} else {
 					const normalizedArgs = normalizeToolArgs(content.arguments);
 					this.#readArgs.set(content.id, normalizedArgs);
 				}
+				appendAssistantSegment(afterToolSegment);
 				continue;
 			}
 
@@ -290,8 +369,9 @@ export class ChatTranscriptBuilder {
 				content.name,
 				content.arguments,
 				{
-					// Images can't be sliced through the scroll viewport; keep them off.
-					showImages: false,
+					// Stable ids and Kitty placeholder cells keep images anchored
+					// while the transcript viewport scrolls and reflows.
+					showImages: settings.get("terminal.showImages"),
 					editFuzzyThreshold: settings.get("edit.fuzzyThreshold"),
 					editAllowFuzzy: settings.get("edit.fuzzyMatch"),
 					liveRegion: this.container,
@@ -313,9 +393,14 @@ export class ChatTranscriptBuilder {
 			} else {
 				this.#pendingTools.set(content.id, component);
 			}
+			appendAssistantSegment(afterToolSegment);
 		}
 
-		this.#pendingUsage = settings.get("display.showTokenUsage") ? message.usage : undefined;
+		this.#pendingUsage =
+			settings.get("display.showTokenUsage") && assistantUsageIsBilled(message.usage) ? message.usage : undefined;
+		this.#pendingUsageDuration = message.duration;
+		this.#pendingUsageTtft = message.ttft;
+		this.#pendingUsageTimestamp = message.timestamp;
 	}
 
 	#appendToolResult(message: Extract<AgentMessage, { role: "toolResult" }>): void {
@@ -337,8 +422,18 @@ export class ChatTranscriptBuilder {
 		if (!pending) return;
 		pending.updateResult(message, false, message.toolCallId);
 		this.#pendingTools.delete(message.toolCallId);
-		if (message.toolName === "job" && pending instanceof ToolExecutionComponent && pending.isDisplaceableBlock()) {
+		if (message.toolName === "hub" && pending instanceof ToolExecutionComponent && pending.isDisplaceableBlock()) {
 			this.#waitingPoll = pending;
+		} else if (
+			message.toolName === "todo" &&
+			pending instanceof ToolExecutionComponent &&
+			pending.canBeDisplacedBy("todo")
+		) {
+			// A successful todo result supersedes the prior live snapshot. Failed
+			// follow-ups return false from canBeDisplacedBy("todo"), so the
+			// last-good panel stays on screen.
+			this.#resolveTodoSnapshot("todo");
+			this.#todoSnapshot = pending;
 		}
 	}
 

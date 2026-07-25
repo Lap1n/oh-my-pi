@@ -392,6 +392,53 @@ describe("ACP event mapper", () => {
 		expect(update.locations).toEqual([{ path: "single.ts" }]);
 	});
 
+	it("resolves live image blob refs for ACP content without expanding rawOutput", () => {
+		const blobRef = "blob:sha256:77467fcfe2bbdc034e0eabb4778c9d7de521c0d7c3e0d0a62566468e4d7da3a5";
+		const resolvedImageData = "resolved-webp-base64";
+		const events: AgentSessionEvent[] = [
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-image-update",
+				toolName: "generate_image",
+				args: {},
+				partialResult: {
+					content: [{ type: "image", data: blobRef, mimeType: "image/webp" }],
+					details: { images: [{ data: blobRef, mimeType: "image/webp" }] },
+				},
+			} as AgentSessionEvent,
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-image-end",
+				toolName: "generate_image",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "Generated image saved." }],
+					details: { images: [{ data: blobRef, mimeType: "image/webp" }] },
+				},
+			} as AgentSessionEvent,
+		];
+
+		for (const event of events) {
+			const updates = mapAgentSessionEventToAcpSessionUpdates(event, "session-1", {
+				resolveImageData: data => (data === blobRef ? resolvedImageData : data),
+			});
+			const update = updates[0]!.update as {
+				content?: Array<{
+					type: string;
+					content?: { type: string; data?: string; mimeType?: string; text?: string };
+				}>;
+				rawOutput?: unknown;
+			};
+			const images = update.content?.filter(item => item.type === "content" && item.content?.type === "image") ?? [];
+
+			expect(images).toEqual([
+				{ type: "content", content: { type: "image", data: resolvedImageData, mimeType: "image/webp" } },
+			]);
+			expect(JSON.stringify(update.content)).not.toContain("blob:sha256:");
+			expect(JSON.stringify(update.rawOutput)).toContain(blobRef);
+		}
+	});
+
 	it("emits locations on tool_execution_update from args", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
@@ -942,6 +989,45 @@ describe("ACP event mapper", () => {
 		const update = updates[0]!.update as { sessionUpdate: string; locations?: { path: string }[] };
 		expect(update.sessionUpdate).toBe("tool_call");
 		expect(update.locations).toEqual([{ path: "src/current.ts" }, { path: "src/old.ts" }, { path: "src/new.ts" }]);
+	});
+
+	it("maps xd:// device writes to an execute call with no fabricated file location", () => {
+		const update = buildToolCallStartUpdate({
+			toolCallId: "toolu_xd_write",
+			toolName: "write",
+			args: { path: "xd://github", content: '{"op":"repo_view"}' },
+			cwd: path.resolve("/repo"),
+		});
+
+		expectAcpStructure(arkSessionNotification, { sessionId: "session-1", update });
+		expect(update).toMatchObject({
+			sessionUpdate: "tool_call",
+			title: "xd://github",
+			kind: "execute",
+		});
+		expect("locations" in update).toBe(false);
+	});
+
+	it("keeps xd:// discovery reads as read kind and plain file writes as edit", () => {
+		const discovery = buildToolCallStartUpdate({
+			toolCallId: "toolu_xd_read",
+			toolName: "read",
+			args: { path: "xd://lsp" },
+		});
+		expect(discovery).toMatchObject({ title: "xd://lsp", kind: "read" });
+		expect("locations" in discovery).toBe(false);
+
+		const fileWrite = buildToolCallStartUpdate({
+			toolCallId: "toolu_file_write",
+			toolName: "write",
+			args: { path: "src/foo.ts", content: "x" },
+			cwd: path.resolve("/repo"),
+		});
+		expect(fileWrite).toMatchObject({
+			title: "write: src/foo.ts",
+			kind: "edit",
+			locations: [{ path: path.resolve("/repo", "src/foo.ts") }],
+		});
 	});
 
 	it("rejects mutated ACP notification discriminators", () => {

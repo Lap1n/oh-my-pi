@@ -1,5 +1,5 @@
 /**
- * Internal URL router for internal protocols (`agent://`, `artifact://`, `history://`, `issue://`, `local://`, `mcp://`, `memory://`, `omp://`, `pr://`, `rule://`, `skill://`, and `vault://`).
+ * Internal URL router for internal protocols (`agent://`, `artifact://`, `history://`, `issue://`, `local://`, `mcp://`, `memory://`, `omp://`, `pr://`, `rule://`, `skill://`, `ssh://`, `vault://`, and `xd://`).
  *
  * One process-global router with one handler per scheme. Access via
  * `InternalUrlRouter.instance()`. Handlers are stateless; per-session and
@@ -16,8 +16,17 @@ import { OmpProtocolHandler } from "./omp-protocol";
 import { parseInternalUrl } from "./parse";
 import { RuleProtocolHandler } from "./rule-protocol";
 import { SkillProtocolHandler } from "./skill-protocol";
-import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, UrlCompletion } from "./types";
+import { SshProtocolHandler } from "./ssh-protocol";
+import type {
+	InternalResource,
+	InternalUrl,
+	ProtocolHandler,
+	ResolveContext,
+	UrlCompletion,
+	WriteContext,
+} from "./types";
 import { VaultProtocolHandler } from "./vault-protocol";
+import { XdProtocolHandler } from "./xd-protocol";
 
 export class InternalUrlRouter {
 	static #instance: InternalUrlRouter | undefined;
@@ -37,6 +46,8 @@ export class InternalUrlRouter {
 		this.register(new IssueProtocolHandler());
 		this.register(new PrProtocolHandler());
 		this.register(new HistoryProtocolHandler());
+		this.register(new SshProtocolHandler());
+		this.register(new XdProtocolHandler());
 	}
 
 	/** Process-global router instance. */
@@ -81,25 +92,39 @@ export class InternalUrlRouter {
 	 * Candidate completions for the host/path portion of `scheme://<query>`.
 	 * Returns `null` when the scheme is unknown or does not support completion.
 	 */
-	async complete(scheme: string, query: string): Promise<UrlCompletion[] | null> {
+	async complete(scheme: string, query: string, context?: ResolveContext): Promise<UrlCompletion[] | null> {
 		const handler = this.#handlers.get(scheme.toLowerCase());
 		if (!handler?.complete) return null;
-		return handler.complete(query);
+		return handler.complete(query, context);
 	}
 
-	async resolve(input: string, context?: ResolveContext): Promise<InternalResource> {
+	#route(input: string): { parsed: InternalUrl; handler: ProtocolHandler } {
 		const parsed = parseInternalUrl(input);
 		const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();
 		const handler = this.#handlers.get(scheme);
-
 		if (!handler) {
 			const available = Array.from(this.#handlers.keys())
-				.map(s => `${s}://`)
+				.map(candidate => `${candidate}://`)
 				.join(", ");
 			throw new Error(`Unknown protocol: ${scheme}://\nSupported: ${available || "none"}`);
 		}
+		return { parsed, handler };
+	}
 
-		const resource = await handler.resolve(parsed as InternalUrl, context);
+	/** Resolve an internal URL through its registered protocol handler. */
+	async resolve(input: string, context?: ResolveContext): Promise<InternalResource> {
+		const { parsed, handler } = this.#route(input);
+		const resource = await handler.resolve(parsed, context);
 		return { ...resource, immutable: resource.immutable ?? handler.immutable };
+	}
+
+	/** Write an internal URL through its registered protocol handler. */
+	async write(input: string, content: string, context?: WriteContext): Promise<void> {
+		const { parsed, handler } = this.#route(input);
+		if (!handler.write) {
+			const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();
+			throw new Error(`${scheme}:// URLs are read-only for write; use the protocol-specific tool for mutations.`);
+		}
+		await handler.write(parsed, content, context);
 	}
 }

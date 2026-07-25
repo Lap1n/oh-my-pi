@@ -1,11 +1,14 @@
 import type { KnownProvider } from "@oh-my-pi/pi-catalog";
 import { aimlApiProvider } from "./aimlapi";
 import { alibabaCodingPlanProvider } from "./alibaba-coding-plan";
+import { alibabaTokenPlanProvider } from "./alibaba-token-plan";
 import { amazonBedrockProvider } from "./amazon-bedrock";
 import { anthropicProvider } from "./anthropic";
 import { azureProvider } from "./azure";
+import { basetenProvider } from "./baseten";
 import { cerebrasProvider } from "./cerebras";
 import { cloudflareAiGatewayProvider } from "./cloudflare-ai-gateway";
+import { coreWeaveProvider } from "./coreweave";
 import { cursorProvider } from "./cursor";
 import { deepseekProvider } from "./deepseek";
 import { devinProvider } from "./devin";
@@ -13,6 +16,7 @@ import { firepassProvider } from "./firepass";
 import { fireworksProvider } from "./fireworks";
 import { githubCopilotProvider } from "./github-copilot";
 import { gitlabDuoProvider } from "./gitlab-duo";
+import { gitLabDuoWorkflowProvider } from "./gitlab-duo-workflow";
 import { googleProvider } from "./google";
 import { googleAntigravityProvider } from "./google-antigravity";
 import { googleGeminiCliProvider } from "./google-gemini-cli";
@@ -25,12 +29,14 @@ import { kimiCodeProvider } from "./kimi-code";
 import { litellmProvider } from "./litellm";
 import { llamaCppProvider } from "./llama-cpp";
 import { lmStudioProvider } from "./lm-studio";
+import { metaProvider } from "./meta";
 import { minimaxProvider } from "./minimax";
 import { minimaxCodeProvider } from "./minimax-code";
 import { minimaxCodeCnProvider } from "./minimax-code-cn";
 import { mistralProvider } from "./mistral";
 import { moonshotProvider } from "./moonshot";
 import { nanogptProvider } from "./nanogpt";
+import { novitaProvider } from "./novita";
 import { nvidiaProvider } from "./nvidia";
 import { ollamaProvider } from "./ollama";
 import { ollamaCloudProvider } from "./ollama-cloud";
@@ -60,7 +66,7 @@ import { xiaomiProvider } from "./xiaomi";
 import { xiaomiTokenPlanAmsProvider } from "./xiaomi-token-plan-ams";
 import { xiaomiTokenPlanCnProvider } from "./xiaomi-token-plan-cn";
 import { xiaomiTokenPlanSgpProvider } from "./xiaomi-token-plan-sgp";
-import { zaiProvider } from "./zai";
+import { zaiCodingPlanProvider, zaiProvider } from "./zai";
 import { zenmuxProvider } from "./zenmux";
 import { zhipuCodingPlanProvider } from "./zhipu-coding-plan";
 
@@ -76,6 +82,7 @@ const ALL = [
 	openaiCodexProvider,
 	anthropicProvider,
 	zaiProvider,
+	zaiCodingPlanProvider,
 	kimiCodeProvider,
 	openrouterProvider,
 	githubCopilotProvider,
@@ -86,7 +93,9 @@ const ALL = [
 	openaiCodexDeviceProvider,
 	xaiOauthProvider,
 	gitlabDuoProvider,
+	gitLabDuoWorkflowProvider,
 	alibabaCodingPlanProvider,
+	alibabaTokenPlanProvider,
 	aimlApiProvider,
 	zhipuCodingPlanProvider,
 	umansProvider,
@@ -100,11 +109,14 @@ const ALL = [
 	xiaomiTokenPlanCnProvider,
 	firepassProvider,
 	deepseekProvider,
+	metaProvider,
 	moonshotProvider,
 	cerebrasProvider,
+	basetenProvider,
 	fireworksProvider,
 	togetherProvider,
 	nvidiaProvider,
+	novitaProvider,
 	huggingfaceProvider,
 	perplexityProvider,
 	qianfanProvider,
@@ -112,6 +124,7 @@ const ALL = [
 	syntheticProvider,
 	nanogptProvider,
 	waferServerlessProvider,
+	coreWeaveProvider,
 	vercelAiGatewayProvider,
 	cloudflareAiGatewayProvider,
 	litellmProvider,

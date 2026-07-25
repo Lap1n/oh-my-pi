@@ -4,7 +4,7 @@
 import { APP_NAME, CONFIG_DIR_NAME, logger } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
 import { CLI_THINKING_LEVELS, type ConfiguredThinkingLevel, parseCliThinkingLevel } from "../thinking";
-import { BUILTIN_TOOL_NAMES } from "../tools/builtin-names";
+import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, normalizeToolNames } from "../tools/builtin-names";
 import {
 	OPTIONAL_FLAGS,
 	OPTIONAL_VALUE_FLAGS,
@@ -13,11 +13,14 @@ import {
 	STRING_SETTERS,
 	STRING_VALUE_FLAGS,
 } from "./flag-tables";
+import { CliUsageError } from "./usage-error";
 
 export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui";
 
 export interface Args {
 	cwd?: string;
+	/** Workspace directories beyond cwd for this session (repeatable `--add-dir`). */
+	addDir?: string[];
 	profile?: string;
 	alias?: string;
 	allowHome?: boolean;
@@ -27,6 +30,11 @@ export interface Args {
 	smol?: string;
 	slow?: string;
 	plan?: string;
+	prewalk?: boolean;
+	noPrewalk?: boolean;
+	prewalkInto?: string;
+	planYolo?: boolean;
+	planYoloInto?: string;
 	maxTime?: number;
 	apiKey?: string;
 	systemPrompt?: string;
@@ -42,6 +50,7 @@ export interface Args {
 	noSession?: boolean;
 	sessionDir?: string;
 	providerSessionId?: string;
+	providerPromptCacheKey?: string;
 	fork?: string;
 	/** Collab link to join at startup (set by the `join` subcommand; no CLI flag). */
 	join?: string;
@@ -89,9 +98,39 @@ export interface Args {
 const PARSE_DEPS: ParseDeps = {
 	logger,
 	parseThinking: parseCliThinkingLevel,
-	builtinToolNames: BUILTIN_TOOL_NAMES,
+	builtinToolNames: [...BUILTIN_TOOL_NAMES, ...HIDDEN_TOOL_NAMES],
+	normalizeToolNames,
 	thinkingEfforts: CLI_THINKING_LEVELS,
 };
+
+const WINDOWS_PATH_VALUE_FLAGS: ReadonlySet<string> = new Set(["--extension", "-e", "--hook"]);
+const WINDOWS_PATH_START_RE =
+	/^(?:[A-Za-z]:[\\/]|\\\\[?]\\(?:[A-Za-z]:[\\/]|UNC[\\/])|\\\\[^\\/]+[\\/][^\\/]+[\\/]|\/\/[?]\/(?:[A-Za-z]:\/|UNC\/)|\/\/[^/]+\/[^/]+\/)/;
+const WINDOWS_MODULE_PATH_SUFFIX_RE = /\.(?:[cm]?[jt]sx?)$/i;
+
+function consumeBuiltInStringValue(flag: string, args: string[], valueIndex: number): { value: string; index: number } {
+	const value = args[valueIndex];
+	if (
+		value === undefined ||
+		!WINDOWS_PATH_VALUE_FLAGS.has(flag) ||
+		!WINDOWS_PATH_START_RE.test(value) ||
+		WINDOWS_MODULE_PATH_SUFFIX_RE.test(value)
+	) {
+		return { value: value ?? "", index: valueIndex };
+	}
+
+	let candidate = value;
+	for (let index = valueIndex + 1; index < args.length; index++) {
+		const next = args[index];
+		if (next === PROFILE_BOOTSTRAP_BOUNDARY_ARG || next.startsWith("-")) break;
+		candidate += ` ${next}`;
+		if (WINDOWS_MODULE_PATH_SUFFIX_RE.test(candidate)) {
+			return { value: candidate, index };
+		}
+	}
+
+	return { value, index: valueIndex };
+}
 
 export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { type: "boolean" | "string" }>): Args {
 	// Work on a copy: the `--option=value` handling below splices the value
@@ -160,7 +199,9 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			// here only when its boolean extension is NOT loaded) would otherwise swallow
 			// the marker as its value and drop the user's trailing message.
 			if (i + 1 < args.length && args[i + 1] !== PROFILE_BOOTSTRAP_BOUNDARY_ARG) {
-				STRING_SETTERS[arg](result, args[++i], PARSE_DEPS);
+				const consumed = consumeBuiltInStringValue(arg, args, i + 1);
+				i = consumed.index;
+				STRING_SETTERS[arg](result, consumed.value, PARSE_DEPS);
 			}
 		} else if (OPTIONAL_VALUE_FLAGS.has(arg)) {
 			const config = OPTIONAL_FLAGS[arg];
@@ -198,6 +239,12 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			result.hideThinking = true;
 		} else if (arg === "--advisor") {
 			result.advisor = true;
+		} else if (arg === "--prewalk") {
+			result.prewalk = true;
+		} else if (arg === "--no-prewalk") {
+			result.noPrewalk = true;
+		} else if (arg === "--plan-yolo") {
+			result.planYolo = true;
 		} else if (arg === "--print" || arg === "-p") {
 			result.print = true;
 		} else if (arg === "--print-thoughts") {
@@ -266,6 +313,17 @@ export function reportUnrecognizedFlags(
 	return true;
 }
 
+/** Emit a clean CLI usage error without an internal stack trace. */
+export function reportCliUsageError(
+	error: unknown,
+	write: (text: string) => void = text => process.stderr.write(text),
+): boolean {
+	if (!(error instanceof CliUsageError)) return false;
+	write(`${chalk.red(`Error: ${error.message}`)}\n`);
+	write(`Run \`${APP_NAME} --help\` for available flags.\n`);
+	return true;
+}
+
 export function getExtraHelpText(): string {
 	return `${chalk.bold("Environment Variables:")}
   ${chalk.dim("# Core Providers")}
@@ -310,6 +368,8 @@ export function getExtraHelpText(): string {
   PERPLEXITY_API_KEY         - Perplexity web search API key (optional; anonymous fallback)
   PERPLEXITY_COOKIES         - Perplexity web search (session cookie)
   TAVILY_API_KEY             - Tavily web search
+  TINYFISH_API_KEY           - TinyFish web search
+  FIRECRAWL_API_KEY          - Firecrawl web search
   ANTHROPIC_SEARCH_API_KEY   - Anthropic web search (override; isolates search from main ANTHROPIC_API_KEY)
   ANTHROPIC_SEARCH_BASE_URL  - Anthropic web search base URL (override; pairs with ANTHROPIC_SEARCH_API_KEY)
 
@@ -330,12 +390,13 @@ ${chalk.bold("Available Tools (default-enabled unless noted):")}
   edit          - Edit files with find/replace
   write         - Write files (creates/overwrites)
   grep          - Search file contents
-  find          - Find files by glob pattern
+  glob          - Find files by glob pattern
   lsp           - Language server protocol (code intelligence)
   python        - Execute Python code (requires: ${APP_NAME} setup python)
   notebook      - Edit Jupyter notebooks
   inspect_image - Analyze images with a vision model
   browser       - Browser automation (Puppeteer)
+  computer      - Native host desktop capture and input (disabled by default)
   task          - Launch sub-agents for parallel tasks
   todo          - Manage todo/task lists
   web_search    - Search the web

@@ -11,9 +11,12 @@ import { ollamaCloudModelManagerOptions } from "./ollama";
 import {
 	aimlApiModelManagerOptions,
 	alibabaCodingPlanModelManagerOptions,
+	alibabaTokenPlanModelManagerOptions,
 	anthropicModelManagerOptions,
+	basetenModelManagerOptions,
 	cerebrasModelManagerOptions,
 	cloudflareAiGatewayModelManagerOptions,
+	coreWeaveModelManagerOptions,
 	deepseekModelManagerOptions,
 	firepassModelManagerOptions,
 	fireworksModelManagerOptions,
@@ -24,9 +27,11 @@ import {
 	kimiCodeModelManagerOptions,
 	litellmModelManagerOptions,
 	lmStudioModelManagerOptions,
+	metaModelManagerOptions,
 	mistralModelManagerOptions,
 	moonshotModelManagerOptions,
 	nanoGptModelManagerOptions,
+	novitaModelManagerOptions,
 	nvidiaModelManagerOptions,
 	ollamaModelManagerOptions,
 	openaiModelManagerOptions,
@@ -49,7 +54,12 @@ import {
 	zenmuxModelManagerOptions,
 	zhipuCodingPlanModelManagerOptions,
 } from "./openai-compat";
-import { cursorModelManagerOptions, devinModelManagerOptions, zaiModelManagerOptions } from "./special";
+import {
+	cursorModelManagerOptions,
+	devinModelManagerOptions,
+	gitLabDuoWorkflowModelManagerOptions,
+	zaiModelManagerOptions,
+} from "./special";
 
 export const CATALOG_PROVIDERS = [
 	{
@@ -68,13 +78,31 @@ export const CATALOG_PROVIDERS = [
 		catalogDiscovery: { label: "Alibaba Coding Plan" },
 	},
 	{
+		id: "alibaba-token-plan",
+		defaultModel: "qwen3.7-plus",
+		envVars: ["ALIBABA_TOKEN_PLAN_API_KEY", "BAILIAN_TOKEN_PLAN_API_KEY"],
+		createModelManagerOptions: (config: ModelManagerConfig) => alibabaTokenPlanModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
+		catalogDiscovery: { label: "QwenCloud Token Plan" },
+	},
+	{
+		id: "baseten",
+		defaultModel: "moonshotai/Kimi-K2.7-Code",
+		envVars: ["BASETEN_API_KEY"],
+		createModelManagerOptions: (config: ModelManagerConfig) => basetenModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
+		catalogDiscovery: { label: "Baseten" },
+	},
+	{
 		id: "amazon-bedrock",
 		defaultModel: "us.anthropic.claude-opus-4-8",
 	},
 	{
 		id: "anthropic",
 		defaultModel: "claude-opus-4-8",
+		envVars: ["ANTHROPIC_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => anthropicModelManagerOptions(config),
+		catalogDiscovery: { label: "Anthropic" },
 	},
 	{
 		id: "azure",
@@ -140,6 +168,13 @@ export const CATALOG_PROVIDERS = [
 		id: "gitlab-duo",
 		defaultModel: "duo-chat-opus-4-6",
 		envVars: ["GITLAB_TOKEN"],
+	},
+	{
+		id: "gitlab-duo-agent",
+		defaultModel: "claude_sonnet_4_6_vertex",
+		envVars: ["GITLAB_TOKEN"],
+		createModelManagerOptions: (config: ModelManagerConfig) => gitLabDuoWorkflowModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
 	},
 	{
 		id: "google",
@@ -225,6 +260,13 @@ export const CATALOG_PROVIDERS = [
 		createModelManagerOptions: (config: ModelManagerConfig) => mistralModelManagerOptions(config),
 	},
 	{
+		id: "meta",
+		defaultModel: "muse-spark-1.1",
+		envVars: ["MODEL_API_KEY", "META_API_KEY"],
+		createModelManagerOptions: (config: ModelManagerConfig) => metaModelManagerOptions(config),
+		catalogDiscovery: { label: "Meta Model API" },
+	},
+	{
 		id: "moonshot",
 		defaultModel: "kimi-k2.7-code",
 		// KIMI_API_KEY is the most intuitive name for a Kimi/Moonshot key; accept it
@@ -246,6 +288,14 @@ export const CATALOG_PROVIDERS = [
 		envVars: ["NVIDIA_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => nvidiaModelManagerOptions(config),
 		catalogDiscovery: { label: "NVIDIA" },
+	},
+	{
+		id: "novita",
+		defaultModel: "moonshotai/kimi-k2.7-code",
+		envVars: ["NOVITA_API_KEY"],
+		createModelManagerOptions: (config: ModelManagerConfig) => novitaModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
+		catalogDiscovery: { label: "Novita", allowUnauthenticated: true },
 	},
 	{
 		id: "ollama",
@@ -278,12 +328,14 @@ export const CATALOG_PROVIDERS = [
 		defaultModel: "kimi-k2.7-code",
 		envVars: ["OPENCODE_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => opencodeGoModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
 	},
 	{
 		id: "opencode-zen",
 		defaultModel: "claude-opus-4-8",
 		envVars: ["OPENCODE_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => opencodeZenModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
 	},
 	{
 		id: "openrouter",
@@ -376,6 +428,13 @@ export const CATALOG_PROVIDERS = [
 		},
 	},
 	{
+		id: "coreweave",
+		defaultModel: "openai/gpt-oss-120b",
+		envVars: ["COREWEAVE_API_KEY", "WANDB_API_KEY"],
+		createModelManagerOptions: (config: ModelManagerConfig) => coreWeaveModelManagerOptions(config),
+		catalogDiscovery: { label: "CoreWeave Serverless Inference" },
+	},
+	{
 		id: "xai",
 		defaultModel: "grok-4-fast-non-reasoning",
 		envVars: ["XAI_API_KEY"],
@@ -393,7 +452,7 @@ export const CATALOG_PROVIDERS = [
 	},
 	{
 		id: "xiaomi",
-		defaultModel: "mimo-v2-flash",
+		defaultModel: "mimo-v2.5",
 		envVars: ["XIAOMI_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => xiaomiModelManagerOptions(config),
 		catalogDiscovery: { label: "Xiaomi" },
@@ -431,13 +490,15 @@ export const CATALOG_PROVIDERS = [
 		defaultModel: "anthropic/claude-opus-4.8",
 		envVars: ["ZENMUX_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => zenmuxModelManagerOptions(config),
-		catalogDiscovery: { label: "ZenMux" },
+		allowUnauthenticated: true,
+		catalogDiscovery: { label: "ZenMux", allowUnauthenticated: true },
 	},
 	{
 		id: "zhipu-coding-plan",
-		defaultModel: "glm-5.2",
+		defaultModel: "glm-5.1",
 		envVars: ["ZHIPU_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => zhipuCodingPlanModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
 		catalogDiscovery: { label: "Zhipu Coding Plan" },
 	},
 ] as const satisfies readonly ProviderCatalogEntry[];

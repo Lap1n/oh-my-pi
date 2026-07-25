@@ -7,26 +7,42 @@
  */
 import { readSseEvents } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
-import type { AuthCredential } from "../auth-storage";
+import type { AuthCredential, DisabledCredentialSummary } from "../auth-storage";
 import type {
+	ClientUsageReportRequest,
+	ClientUsageReportResponse,
+	ClientUsageSummaryResponse,
+	CredentialBlockRequest,
+	CredentialBlockResponse,
+	CredentialBlocksDeleteResponse,
 	CredentialDisableRequest,
 	CredentialDisableResponse,
 	CredentialRefreshResponse,
 	CredentialUploadRequest,
 	CredentialUploadResponse,
+	DisabledCredentialsResponse,
 	HealthzResponse,
 	SnapshotResponse,
 	SnapshotStreamEvent,
+	UsageHistoryResponse,
 	UsageResponse,
+	UsageStaleResponse,
 } from "./types";
 import {
+	clientUsageReportResponseSchema,
+	clientUsageSummaryResponseSchema,
+	credentialBlockResponseSchema,
+	credentialBlocksDeleteResponseSchema,
 	credentialDisableResponseSchema,
 	credentialRefreshResponseSchema,
 	credentialUploadResponseSchema,
+	disabledCredentialsResponseSchema,
 	healthzResponseSchema,
 	snapshotResponseSchema,
 	snapshotStreamEventSchema,
+	usageHistoryResponseSchema,
 	usageResponseSchema,
+	usageStaleResponseSchema,
 } from "./wire-schemas";
 
 export interface AuthBrokerClientOptions {
@@ -106,7 +122,11 @@ export class AuthBrokerClient {
 	}
 
 	healthz(signal?: AbortSignal): Promise<HealthzResponse> {
-		return this.#request("GET", "/v1/healthz", { schema: healthzResponseSchema, auth: false, signal });
+		return this.#request<HealthzResponse>("GET", "/v1/healthz", {
+			schema: healthzResponseSchema,
+			auth: false,
+			signal,
+		});
 	}
 
 	async fetchSnapshot(opts: FetchSnapshotOptions = {}): Promise<FetchSnapshotResult> {
@@ -230,23 +250,83 @@ export class AuthBrokerClient {
 		// `metadata`) but leaves provider-specific extension fields permissive so
 		// the broker can ship new shapes ahead of the client. `raw` is accepted
 		// but normally stripped by the broker before send.
-		return this.#request("GET", "/v1/usage", { schema: usageResponseSchema, signal }) as Promise<UsageResponse>;
+		return this.#request<UsageResponse>("GET", "/v1/usage", { schema: usageResponseSchema, signal });
+	}
+
+	/** Recorded usage-limit snapshots from the broker host, oldest first. */
+	fetchUsageHistory(
+		query?: { sinceMs?: number; provider?: string },
+		signal?: AbortSignal,
+	): Promise<UsageHistoryResponse> {
+		const params = new URLSearchParams();
+		if (query?.sinceMs !== undefined) params.set("sinceMs", String(query.sinceMs));
+		if (query?.provider) params.set("provider", query.provider);
+		const path = `/v1/usage/history${params.size > 0 ? `?${params.toString()}` : ""}`;
+		return this.#request<UsageHistoryResponse>("GET", path, { schema: usageHistoryResponseSchema, signal });
+	}
+
+	/** Report this client's batched observed request usage for per-install burn tracking. */
+	reportClientUsage(report: ClientUsageReportRequest, signal?: AbortSignal): Promise<ClientUsageReportResponse> {
+		return this.#request<ClientUsageReportResponse>("POST", "/v1/usage/observed", {
+			body: report,
+			schema: clientUsageReportResponseSchema,
+			signal,
+		});
+	}
+
+	/** Per-client token burn aggregates recorded by the broker host. */
+	fetchClientUsageSummary(query?: { sinceMs?: number }, signal?: AbortSignal): Promise<ClientUsageSummaryResponse> {
+		const params = new URLSearchParams();
+		if (query?.sinceMs !== undefined) params.set("sinceMs", String(query.sinceMs));
+		const path = `/v1/usage/clients${params.size > 0 ? `?${params.toString()}` : ""}`;
+		return this.#request<ClientUsageSummaryResponse>("GET", path, {
+			schema: clientUsageSummaryResponseSchema,
+			signal,
+		});
+	}
+
+	notifyUsageStale(signal?: AbortSignal): Promise<UsageStaleResponse> {
+		return this.#request<UsageStaleResponse>("POST", "/v1/usage/stale", {
+			schema: usageStaleResponseSchema,
+			signal,
+		});
 	}
 
 	async refreshCredential(id: number, signal?: AbortSignal): Promise<CredentialRefreshResponse> {
-		return this.#request("POST", `/v1/credential/${id}/refresh`, {
+		return this.#request<CredentialRefreshResponse>("POST", `/v1/credential/${id}/refresh`, {
 			schema: credentialRefreshResponseSchema,
 			signal,
-		}) as Promise<CredentialRefreshResponse>;
+		});
 	}
 
 	async disableCredential(id: number, cause: string, signal?: AbortSignal): Promise<CredentialDisableResponse> {
 		const body: CredentialDisableRequest = { cause };
-		return this.#request("POST", `/v1/credential/${id}/disable`, {
+		return this.#request<CredentialDisableResponse>("POST", `/v1/credential/${id}/disable`, {
 			body,
 			schema: credentialDisableResponseSchema,
 			signal,
 		});
+	}
+
+	/**
+	 * Disabled-credential tombstones (identity + cause, no token material).
+	 * Returns an empty list against brokers predating `GET
+	 * /v1/credentials/disabled` (404).
+	 */
+	async listDisabledCredentials(provider?: string, signal?: AbortSignal): Promise<DisabledCredentialSummary[]> {
+		const params = new URLSearchParams();
+		if (provider) params.set("provider", provider);
+		const path = `/v1/credentials/disabled${params.size > 0 ? `?${params.toString()}` : ""}`;
+		try {
+			const response = await this.#request<DisabledCredentialsResponse>("GET", path, {
+				schema: disabledCredentialsResponseSchema,
+				signal,
+			});
+			return response.disabled;
+		} catch (error) {
+			if (error instanceof AuthBrokerError && error.status === 404) return [];
+			throw error;
+		}
 	}
 
 	async uploadCredential(
@@ -255,18 +335,38 @@ export class AuthBrokerClient {
 		signal?: AbortSignal,
 	): Promise<CredentialUploadResponse> {
 		const body: CredentialUploadRequest = { provider, credential };
-		return this.#request("POST", "/v1/credential", {
+		return this.#request<CredentialUploadResponse>("POST", "/v1/credential", {
 			body,
 			schema: credentialUploadResponseSchema,
 			signal,
-		}) as Promise<CredentialUploadResponse>;
+		});
 	}
 
-	async #request(
-		method: "GET" | "POST",
+	async upsertCredentialBlock(
+		id: number,
+		block: CredentialBlockRequest,
+		signal?: AbortSignal,
+	): Promise<CredentialBlockResponse> {
+		const body: CredentialBlockRequest = block;
+		return this.#request<CredentialBlockResponse>("POST", `/v1/credential/${id}/block`, {
+			body,
+			schema: credentialBlockResponseSchema,
+			signal,
+		});
+	}
+
+	async deleteCredentialBlocks(id: number, signal?: AbortSignal): Promise<CredentialBlocksDeleteResponse> {
+		return this.#request<CredentialBlocksDeleteResponse>("DELETE", `/v1/credential/${id}/blocks`, {
+			schema: credentialBlocksDeleteResponseSchema,
+			signal,
+		});
+	}
+
+	async #request<t>(
+		method: "GET" | "POST" | "DELETE",
 		path: string,
 		opts: { schema: (input: unknown) => unknown; auth?: boolean; body?: unknown; signal?: AbortSignal },
-	): Promise<any> {
+	): Promise<t> {
 		const response = await this.#fetchRaw(method, path, opts);
 		const text = await response.text();
 		const raw = this.#parseJson(text, response.status);
@@ -277,7 +377,7 @@ export class AuthBrokerClient {
 				body: validated.summary,
 			});
 		}
-		return validated;
+		return validated as t;
 	}
 
 	#parseJson(text: string, status: number): unknown {
@@ -293,7 +393,7 @@ export class AuthBrokerClient {
 	}
 
 	async #fetchRaw(
-		method: "GET" | "POST",
+		method: "GET" | "POST" | "DELETE",
 		path: string,
 		opts: {
 			auth?: boolean;

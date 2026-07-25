@@ -1,8 +1,12 @@
 pub mod cancel;
-pub mod fixup;
+mod cmp;
+mod coreutils;
+mod fd;
 pub mod minimizer;
+mod moreutils;
 pub mod process;
 pub mod shell;
+mod which;
 #[cfg(windows)]
 pub mod windows;
 
