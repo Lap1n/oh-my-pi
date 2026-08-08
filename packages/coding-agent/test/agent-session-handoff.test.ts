@@ -744,8 +744,10 @@ describe("AgentSession handoff", () => {
 			details: {},
 			preserveData: { resultState: "keep-result" },
 		});
+		const promptCacheKey = "inherited-parent-cache";
 		const localAgent = new Agent({
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			promptCacheKey,
 		});
 		const localSession = new AgentSession({
 			agent: localAgent,
@@ -762,6 +764,7 @@ describe("AgentSession handoff", () => {
 		try {
 			await localSession.runIdleCompaction();
 			expect(compactSpy).toHaveBeenCalledTimes(1);
+			expect(compactSpy.mock.calls[0]?.[5]?.promptCacheKey).toBe(promptCacheKey);
 			const compactionEntry = localSessionManager.getEntries().find(entry => entry.type === "compaction");
 			if (compactionEntry?.type !== "compaction") throw new Error("Expected persisted compaction entry");
 			expect(compactionEntry.preserveData).toEqual({
@@ -846,6 +849,7 @@ describe("AgentSession handoff", () => {
 		expect(fallbackCandidateKey).toBeDefined();
 		expect(promptSpy).toHaveBeenCalledTimes(1);
 	});
+
 	it("keeps pre-prompt context-full checks aligned with provider-anchored usage", async () => {
 		await session.dispose();
 		authStorage.setRuntimeApiKey("openai", "test-key");
@@ -2005,5 +2009,20 @@ describe("AgentSession handoff", () => {
 		await expect(handoffPromise).rejects.toThrow("Handoff cancelled");
 		expect(generateHandoffSpy).toHaveBeenCalledTimes(1);
 		expect(generateHandoffSpy.mock.calls[0]?.[2]?.streamOptions?.signal?.aborted).toBe(true);
+	});
+
+	it("surfaces the real error when generation fails without a user abort", async () => {
+		// Providers throw name==="AbortError" errors on non-user conditions (stalls,
+		// nested resolution failures). The handoff signal is never aborted here, so the
+		// failure must surface verbatim instead of being masked as "Handoff cancelled".
+		const providerError = new Error("Deepseek stream stalled");
+		providerError.name = "AbortError";
+		const generateHandoffSpy = vi
+			.spyOn(compactionModule, "generateHandoffFromContext")
+			.mockRejectedValue(providerError);
+
+		await expect(session.handoff()).rejects.toThrow("Deepseek stream stalled");
+		expect(generateHandoffSpy).toHaveBeenCalledTimes(1);
+		expect(session.isGeneratingHandoff).toBe(false);
 	});
 });
