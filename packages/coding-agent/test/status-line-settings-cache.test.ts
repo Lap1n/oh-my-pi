@@ -270,11 +270,41 @@ describe("StatusLineComponent effective settings cache", () => {
 });
 
 describe("StatusLineComponent hook statuses", () => {
-	it("renders every keyed status on a deterministic line", () => {
-		const component = makeComponent({ showHookStatus: true });
+	it("renders in the bar when a segment list carries `hook`, and not again below it", () => {
+		// Every built-in preset carries `hook`, so a preset user gets the chip
+		// rather than a bare line under the composer.
+		const component = makeComponent({ showHookStatus: true, sessionAccent: false });
+		component.setHookStatus("project-time", "$0.04 (dev)");
+		component.setHookStatus("ponytail", "Ponytail");
+
+		expect(component.render(8)).toEqual([]);
+
+		const bar = stripVTControlCharacters(component.getTopBorder(200).content);
+		expect(bar).toContain("Ponytail");
+		expect(bar).toContain("$0.04 (dev)");
+		// Key order, so the chip order cannot flap between renders.
+		expect(bar.indexOf("Ponytail")).toBeLessThan(bar.indexOf("$0.04 (dev)"));
+	});
+
+	it("renders every keyed status on a deterministic line when no segment list carries `hook`", () => {
+		const component = makeComponent({
+			showHookStatus: true,
+			preset: "custom",
+			leftSegments: ["pi"],
+			rightSegments: ["session_name"],
+			sessionAccent: false,
+		});
 		component.setHookStatus("project-time", "$0.04 (dev)");
 		component.setHookStatus("ponytail", "Ponytail");
 
 		expect(component.render(8)).toEqual(["Ponytail", "$0.04 (…"]);
+	});
+
+	it("shows the chip nowhere when hook status is switched off", () => {
+		const component = makeComponent({ showHookStatus: false, sessionAccent: false });
+		component.setHookStatus("ponytail", "Ponytail");
+
+		expect(component.render(8)).toEqual([]);
+		expect(stripVTControlCharacters(component.getTopBorder(200).content)).not.toContain("Ponytail");
 	});
 });

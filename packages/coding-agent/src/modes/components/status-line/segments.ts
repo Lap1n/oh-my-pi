@@ -5,7 +5,7 @@ import { SPINNER_ADVANCE_MS, TERMINAL } from "@oh-my-pi/pi-tui";
 import { formatDuration, formatNumber, getProjectDir, pathIsWithin, relativePathWithinRoot } from "@oh-my-pi/pi-utils";
 import { type Theme, type ThemeColor, theme } from "../../../modes/theme/theme";
 import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../../../tools/render-utils";
-import { fileHyperlink } from "../../../tui/hyperlink";
+import { fileHyperlink, urlHyperlink } from "../../../tui/hyperlink";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../../../utils/session-color";
 import { sanitizeStatusText } from "../../shared";
 import { formatContextUsage, getContextUsageLevel, getContextUsageThemeColor } from "./context-thresholds";
@@ -711,6 +711,53 @@ const collabSegment: StatusLineSegment = {
 	},
 };
 
+/**
+ * Wider than this and a chatty hook starts squeezing the context gauge, which
+ * belongs to the bar rather than to any one hook. The full text is never lost:
+ * a hook that needs to say more says it in its own command's output.
+ */
+const HOOK_LABEL_WIDTH = 24;
+
+/**
+ * A trailing URL is the chip's link target, not part of its label. The leading
+ * `\s+` is what makes a label mandatory: a status that is *only* a URL keeps it
+ * as visible text, because a chip with no label is nothing to click.
+ */
+const HOOK_STATUS_URL = /\s+(https?:\/\/\S+)$/;
+
+/**
+ * Hook-published statuses, inline in the bar rather than on their own line
+ * below it.
+ *
+ * Hook text is plain by construction — `sanitizeStatusText` replaces ESC
+ * before any renderer sees it — so a hook cannot colour its own chip, and the
+ * theme's hook icon brands the group once instead of each hook picking a
+ * codepoint the active symbol preset may not carry. The names inside identify
+ * which hook is speaking.
+ *
+ * A trailing URL becomes the chip's OSC 8 target and is dropped from the
+ * label, so `vitrine 3 http://127.0.0.1:7391/s/…` renders as a clickable
+ * `vitrine 3`. A status you click beats a URL you select.
+ */
+const hookSegment: StatusLineSegment = {
+	id: "hook",
+	render(ctx) {
+		const chips: string[] = [];
+		for (const raw of ctx.hookStatuses ?? []) {
+			const text = sanitizeStatusText(raw);
+			if (!text) continue;
+			const link = HOOK_STATUS_URL.exec(text);
+			// `sanitizeStatusText` has already trimmed, and the regex above requires
+			// a label before the URL, so the slice cannot come back empty.
+			const label = truncateToWidth(link ? text.slice(0, link.index) : text, HOOK_LABEL_WIDTH);
+			chips.push(link ? urlHyperlink(link[1], label) : label);
+		}
+		if (chips.length === 0) return { content: "", visible: false };
+
+		return { content: theme.fg("muted", withIcon(theme.icon.extensionHook, chips.join(theme.sep.dot))), visible: true };
+	},
+};
+
 function pickUsageColor(percent: number): "muted" | "warning" | "error" {
 	if (percent >= 80) return "error";
 	if (percent >= 50) return "warning";
@@ -817,6 +864,7 @@ export const SEGMENTS: Record<StatusLineSegmentId, StatusLineSegment> = {
 	session_name: sessionNameSegment,
 	usage: usageSegment,
 	collab: collabSegment,
+	hook: hookSegment,
 };
 
 export function renderSegment(id: StatusLineSegmentId, ctx: SegmentContext): RenderedSegment {

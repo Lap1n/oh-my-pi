@@ -233,6 +233,15 @@ function variantsFor(id: StatusLineSegmentId): readonly SegmentVariantSpec[] {
 				{ label: "host active", context: { collab: { role: "host", participantCount: 3 } } },
 				{ label: "guest active", context: { collab: { role: "guest", participantCount: 3 } } },
 			];
+		case "hook":
+			return [
+				{ label: "one hook", context: { hookStatuses: ["vitrine 3 http://127.0.0.1:7391/s/01a05f8a"] } },
+				{ label: "two hooks", context: { hookStatuses: ["notes 12", "vitrine 3"] } },
+				{
+					label: "over the label cap",
+					context: { hookStatuses: ["a hook with rather a lot to say about itself"] },
+				},
+			];
 		default:
 			return [{ label: "canonical" }];
 	}

@@ -728,6 +728,24 @@ export class StatusLineComponent implements Component {
 		}
 	}
 
+	/** Hook statuses in key order, so the bar's chip order is stable across renders. */
+	#sortedHookStatuses(): readonly string[] {
+		if (this.#hookStatuses.size === 0) return [];
+		return Array.from(this.#hookStatuses.entries())
+			.sort(([a], [b]) => a.localeCompare(b))
+			.map(([, text]) => text);
+	}
+
+	/**
+	 * True when a configured segment list carries `hook`, in which case the
+	 * statuses render inside the bar and the standalone lines below it would be
+	 * the same text twice.
+	 */
+	#hookStatusInBar(): boolean {
+		const { leftSegments, rightSegments } = this.#resolveSettings();
+		return leftSegments.includes("hook") || rightSegments.includes("hook");
+	}
+
 	watchBranch(onBranchChange: () => void): void {
 		this.#onBranchChange = onBranchChange;
 		this.#setupGitWatcher();
@@ -1839,6 +1857,9 @@ export class StatusLineComponent implements Component {
 			},
 			worktree: activeRepoCache.worktree,
 			usage: this.#cachedUsage,
+			// One switch, both placements: `showHookStatus: false` empties the
+			// segment as well as the lines below the bar.
+			hookStatuses: (this.#settings.showHookStatus ?? true) ? this.#sortedHookStatuses() : [],
 		};
 	}
 
@@ -2426,11 +2447,14 @@ export class StatusLineComponent implements Component {
 				lines.push(content);
 			}
 		}
+		// `showHookStatus` still governs whether hook text appears at all; where
+		// it appears is decided by the segment lists, so the two cannot disagree
+		// and there is no second setting to keep in sync.
 		const showHooks = this.#settings.showHookStatus ?? true;
-		if (showHooks && this.#hookStatuses.size > 0) {
-			const hookLines = Array.from(this.#hookStatuses.entries())
-				.sort(([a], [b]) => a.localeCompare(b))
-				.map(([, text]) => truncateToWidth(sanitizeStatusText(text), width));
+		if (showHooks && this.#hookStatuses.size > 0 && !this.#hookStatusInBar()) {
+			const hookLines = this.#sortedHookStatuses().map(text =>
+				truncateToWidth(sanitizeStatusText(text), width),
+			);
 			lines.push(...hookLines);
 		}
 		return lines;

@@ -157,6 +157,13 @@ export interface SegmentContext {
 		sevenDay?: { percent: number; resetHours?: number };
 		monthly?: { percent: number; resetHours?: number };
 	} | null;
+	/**
+	 * Status texts published by hooks through `ui.setStatus`, ordered by key.
+	 * Absent in fixtures and direct-segment previews, which have no hook
+	 * runtime; the `hook` segment then reports itself hidden rather than
+	 * inventing a sample.
+	 */
+	hookStatuses?: readonly string[];
 }
 
 export interface RenderedSegment {

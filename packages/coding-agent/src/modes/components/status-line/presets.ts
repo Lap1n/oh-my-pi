@@ -1,8 +1,11 @@
 import type { PresetDef, StatusLinePreset } from "./types";
 
+// `hook` sits at the end of every left group: it renders nothing until a hook
+// publishes a status, so carrying it costs a preset user no width, and when one
+// does publish the text lands in the bar instead of on a bare line under it.
 export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 	default: {
-		leftSegments: ["pi", "model", "mode", "collab", "path", "git", "pr", "context_pct", "cost"],
+		leftSegments: ["pi", "model", "mode", "collab", "path", "git", "pr", "context_pct", "cost", "hook"],
 		rightSegments: ["session_name"],
 		separator: "powerline-thin",
 		segmentOptions: {
@@ -13,7 +16,7 @@ export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 	},
 
 	minimal: {
-		leftSegments: ["path", "git"],
+		leftSegments: ["path", "git", "hook"],
 		rightSegments: ["session_name", "mode", "context_pct"],
 		separator: "slash",
 		segmentOptions: {
@@ -23,7 +26,7 @@ export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 	},
 
 	compact: {
-		leftSegments: ["model", "mode", "git", "pr"],
+		leftSegments: ["model", "mode", "git", "pr", "hook"],
 		rightSegments: ["session_name", "cost", "context_pct"],
 		separator: "powerline-thin",
 		segmentOptions: {
@@ -33,7 +36,7 @@ export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 	},
 
 	full: {
-		leftSegments: ["pi", "hostname", "model", "mode", "path", "git", "pr", "subagents"],
+		leftSegments: ["pi", "hostname", "model", "mode", "path", "git", "pr", "subagents", "hook"],
 		rightSegments: [
 			"session_name",
 			"cache_hit",
@@ -57,7 +60,7 @@ export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 
 	nerd: {
 		// Full preset with all Nerd Font icons
-		leftSegments: ["pi", "hostname", "model", "mode", "path", "git", "pr", "session", "subagents"],
+		leftSegments: ["pi", "hostname", "model", "mode", "path", "git", "pr", "session", "subagents", "hook"],
 		rightSegments: [
 			"session_name",
 			"token_in",
@@ -82,7 +85,7 @@ export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 
 	ascii: {
 		// No Nerd Font dependencies
-		leftSegments: ["model", "mode", "path", "git", "pr"],
+		leftSegments: ["model", "mode", "path", "git", "pr", "hook"],
 		rightSegments: ["session_name", "token_total", "cost", "context_pct"],
 		separator: "ascii",
 		segmentOptions: {
@@ -94,7 +97,7 @@ export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 
 	custom: {
 		// User-defined - these are just defaults that get overridden
-		leftSegments: ["model", "mode", "path", "git", "pr"],
+		leftSegments: ["model", "mode", "path", "git", "pr", "hook"],
 		rightSegments: ["session_name", "token_total", "cost", "context_pct"],
 		separator: "powerline-thin",
 		segmentOptions: {},

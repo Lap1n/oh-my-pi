@@ -260,7 +260,8 @@ export type StatusLineSegmentId =
 	| "cache_hit"
 	| "session_name"
 	| "usage"
-	| "collab";
+	| "collab"
+	| "hook";
 
 /** Submenu choice metadata. */
 export type SubmenuOption<V extends string = string> = {
@@ -961,7 +962,8 @@ export const SETTINGS_SCHEMA = {
 			tab: "appearance",
 			group: "Status Line",
 			label: "Show Hook Status",
-			description: "Display hook status messages below the status line",
+			description:
+				"Show hook status messages. They render inline as the `hook` segment when a segment list carries it, on their own line below the bar otherwise",
 		},
 	},
 
